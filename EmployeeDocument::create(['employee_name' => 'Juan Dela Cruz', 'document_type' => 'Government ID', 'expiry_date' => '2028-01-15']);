@@ -1,0 +1,8 @@
+[90m= [39m[34;4mApp\Models\EmployeeDocument[39;24m {#7960
+    [34memployee_name[39m: [32m"[39m[32mJuan Dela Cruz[39m[32m"[39m,
+    [34mdocument_type[39m: [32m"[39m[32mSecurity License[39m[32m"[39m,
+    [34mexpiry_date[39m: [32m"[39m[32m2026-10-11 00:00:00[39m[32m"[39m,
+    [34mupdated_at[39m: [32m"[39m[32m2026-10-01 04:10:42[39m[32m"[39m,
+    [34mcreated_at[39m: [32m"[39m[32m2026-10-01 04:10:42[39m[32m"[39m,
+    [34mid[39m: [35m5[39m,
+  }
