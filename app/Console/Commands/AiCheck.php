@@ -23,7 +23,7 @@ class AiCheck extends Command
      * VERSION constant. Do not force every service to use the same number.
      */
     private const EXPECTED_VERSIONS = [
-        RuleAnswers::class => 7,
+        RuleAnswers::class => 8,
         AttendanceAnswers::class => 5,
         ComplianceAnswers::class => 5,
         ApplicantAnswers::class => 5,

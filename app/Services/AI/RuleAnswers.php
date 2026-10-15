@@ -23,7 +23,7 @@ use Illuminate\Support\Str;
 class RuleAnswers
 {
     // Bump this when the file changes. "php artisan ai:check" reads it.
-    public const VERSION = 7;
+    public const VERSION = 8;
 
     private const STATUS_LABELS = [
         'draft' => 'In progress',
@@ -154,14 +154,28 @@ class RuleAnswers
             }
         }
 
+        $isHr = in_array($role, ['HR', 'HR Personnel'], true);
+
+        $questionForRules = $isHr
+            ? $this->withPerson($q, $user['person'] ?? null)
+            : $q;
+
         $answer = match ($role) {
-            'HR', 'HR Personnel' => $this->askHr($this->withPerson($q, $user['person'] ?? null)),
+            'HR', 'HR Personnel' => $this->askHr($questionForRules),
             'Employee' => $this->askEmployee($q, $user['name'] ?? ''),
             default => $this->askApplicant($q),
         };
 
         if ($answer !== null) {
             $answer['asked'] = $q;
+
+            if ($isHr) {
+                $person = $this->personForMemory($questionForRules);
+
+                if ($person !== null) {
+                    $answer['person'] = $person;
+                }
+            }
         }
 
         return $answer;
@@ -174,14 +188,30 @@ class RuleAnswers
             return $q;
         }
 
-        $rest = trim(preg_replace(self::PERIOD_REGEX, '', $q));
-        $rest = trim(preg_replace('/\b(naman|din|rin|pa|at|po|ba)\b/u', '', $rest));
+        preg_match_all(self::PERIOD_REGEX, $q, $periodMatches);
+        $period = $periodMatches[0][0] ?? '';
 
+        if ($period === '') {
+            return $q;
+        }
+
+        $fillers = '/\b(?:what about|how about|and then|paano naman|and|then|naman|din|rin|pa|at|po|ba|eh)\b/u';
+
+        $rest = preg_replace(self::PERIOD_REGEX, ' ', $q);
+        $rest = preg_replace($fillers, ' ', $rest);
+        $rest = trim(preg_replace('/\s+/u', ' ', $rest));
+
+        // Do not rewrite a genuine new question that contains extra content.
         if ($rest !== '') {
             return $q;
         }
 
-        return trim(preg_replace(self::PERIOD_REGEX, '', $previous) . ' ' . $q);
+        // Remove a prior period and filler phrase before applying the new one.
+        $base = preg_replace(self::PERIOD_REGEX, ' ', $previous);
+        $base = preg_replace($fillers, ' ', $base);
+        $base = trim(preg_replace('/\s+/u', ' ', $base));
+
+        return trim($base . ' ' . $period);
     }
 
     // Resolves pronouns such as "siya" to the last person discussed in the chat.
@@ -197,6 +227,25 @@ class RuleAnswers
         }
 
         return $q . ' ' . $this->normalize($last);
+    }
+
+    /**
+     * Return a person only when the question matches exactly one known record.
+     * This metadata is internal and is removed before the response reaches the browser.
+     */
+    private function personForMemory(string $q): ?string
+    {
+        $people = $this->employeeNames()
+            ->merge(Applicant::query()->pluck('name'))
+            ->filter()
+            ->unique()
+            ->values();
+
+        $matches = $this->findEmployees($q, $people);
+
+        return $matches->count() === 1
+            ? $matches->first()
+            : null;
     }
 
     // $lead is the first line: what went wrong, or what to try.
