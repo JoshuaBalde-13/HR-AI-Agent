@@ -34,14 +34,27 @@ class HRISAssistantService
 
     public function ask(AssistantContext $ctx, string $question): array
     {
+        return $this->askWithPath($ctx, $question)['response'];
+    }
+
+    /**
+     * Returns the response plus an internal path so the web controller
+     * can decide whether to use its existing fallback.
+     *
+     * @return array{response: array, path: string}
+     */
+    public function askWithPath(AssistantContext $ctx, string $question): array
+    {
         $question = trim($question);
         $started = microtime(true);
 
         try {
             [$response, $path] = $this->respond($ctx, $question);
         } catch (Throwable $e) {
-            // The details go to the log only. The user gets a safe message.
-            Log::error('Assistant failed: ' . $e->getMessage(), ['exception' => $e]);
+            // Details stay in the log. The user receives a safe message.
+            Log::error('Assistant failed: ' . $e->getMessage(), [
+                'exception' => $e,
+            ]);
 
             $response = $this->rules->help(
                 $ctx->role,
@@ -54,10 +67,9 @@ class HRISAssistantService
         // Internal fields never go to the browser.
         unset($response['person'], $response['asked']);
 
-        // The robot compares this with its own version and warns if the server files are old.
         $response['v'] = RuleAnswers::VERSION;
 
-        // A short audit trail. The question itself is not logged: it can hold personal data.
+        // Do not log the question itself; it may contain personal data.
         Log::info('Assistant request', [
             'role' => $ctx->role,
             'user' => $ctx->userId,
@@ -66,7 +78,10 @@ class HRISAssistantService
             'ms' => (int) round((microtime(true) - $started) * 1000),
         ]);
 
-        return $response;
+        return [
+            'response' => $response,
+            'path' => $path,
+        ];
     }
 
     // Returns [response, path] where path says how the answer was made.

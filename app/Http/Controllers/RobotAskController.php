@@ -8,6 +8,8 @@ use App\Models\AttendanceLog;
 use App\Models\Employee;
 use App\Models\EmployeeDocument;
 use App\Services\OllamaClient;
+use App\Services\AI\AssistantContext;
+use App\Services\AI\HRISAssistantService;
 use App\Services\SystemKnowledge;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -92,10 +94,52 @@ class RobotAskController extends Controller
                 return response()->json($answer);
             }
 
-            // 2. Anything else: the model reads the data this user may see.
-            return response()->json(
-                $this->bySmartMode($request, $role, $text, $user)
+            // 2. Rules in this controller did not match. Ask the modular
+            // assistant to interpret the question and let its rules answer.
+            $context = AssistantContext::fromRequest(
+                $request,
+                $role,
+                $user['name'] ?? null
             );
+
+            $modular = app(HRISAssistantService::class)->askWithPath(
+                $context,
+                $text
+            );
+
+            $path = $modular['path'] ?? 'error';
+            $unavailable = Str::startsWith($path, 'ai-unavailable:');
+            $unhandled = in_array(
+                $path,
+                ['ai-off', 'ai-unknown', 'error'],
+                true
+            );
+
+            // Preserve the old SystemKnowledge fallback when the modular
+            // assistant cannot interpret the question or its router is offline.
+            if ($unhandled || $unavailable) {
+                return response()->json(
+                    $this->bySmartMode($request, $role, $text, $user)
+                );
+            }
+
+            $response = $modular['response'];
+
+            // Keep the older session history usable if a later question falls
+            // through to the legacy assistant.
+            $firstItem = $response['items'][0] ?? [];
+            $reply = is_array($firstItem)
+                ? ($firstItem['text'] ?? $response['title'] ?? 'Assistant response')
+                : ($response['title'] ?? 'Assistant response');
+
+            $this->remember(
+                $request,
+                $role,
+                $text,
+                is_string($reply) ? $reply : 'Assistant response'
+            );
+
+            return response()->json($response);
         } catch (Throwable $e) {
             Log::error('Robot ask failed: ' . $e->getMessage(), ['exception' => $e]);
 
