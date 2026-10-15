@@ -5,6 +5,7 @@ namespace App\Http\Controllers;
 use App\Models\Applicant;
 use App\Models\Application;
 use App\Models\AttendanceLog;
+use App\Models\Employee;
 use App\Models\EmployeeDocument;
 use App\Services\OllamaClient;
 use App\Services\SystemKnowledge;
@@ -307,6 +308,12 @@ class RobotAskController extends Controller
             return $this->hrHours($q);
         }
 
+        $attendanceAnswer = $this->hrAttendanceQuestion($q);
+
+        if ($attendanceAnswer !== null) {
+            return $attendanceAnswer;
+        }
+
         if (
             $this->has($q, ['on duty', 'naka duty', 'nasa duty', 'pumasok', 'who is working', 'clocked in'])
             || $this->hasWord($q, ['present'])
@@ -343,14 +350,386 @@ class RobotAskController extends Controller
         return $this->isGreeting($q) ? $this->help('HR', 'How can I help?') : null;
     }
 
+    /**
+     * Answers employee-specific attendance questions before the generic
+     * on-duty handler gets a chance to intercept them.
+     */
+    private function hrAttendanceQuestion(string $q): ?array
+    {
+        $countTerms = [
+            'ilang beses',
+            'how many times',
+            'attendance record',
+            'attendance count',
+            'count attendance',
+            'ilang araw pumasok',
+        ];
+
+        $attendanceTerms = [
+            'pumasok',
+            'pasok',
+            'attendance',
+            'clock in',
+            'clocked in',
+            'time in',
+            'came in',
+            'check in',
+            'on duty',
+            'naka duty',
+            'nasa duty',
+            'currently working',
+            'working right now',
+        ];
+
+        $lastTerms = [
+            'huling',
+            'last clock',
+            'last time',
+            'kailan huling',
+            'most recent',
+            'when did',
+            'when was',
+        ];
+
+        $isCount = $this->has($q, $countTerms);
+        $isLast = $this->has($q, $lastTerms);
+
+        if (!$this->has($q, $attendanceTerms) && !$isCount) {
+            return null;
+        }
+
+        $isCurrentDuty = $this->has($q, [
+            'on duty',
+            'naka duty',
+            'nasa duty',
+            'who is working',
+            'clocked in',
+            'currently working',
+            'working right now',
+        ]);
+
+        $names = $this->employeeNames()
+            ->merge(
+                AttendanceLog::query()
+                    ->whereNotNull('employee_name')
+                    ->distinct()
+                    ->pluck('employee_name')
+            )
+            ->filter()
+            ->unique()
+            ->sort()
+            ->values();
+
+        $matches = $this->findEmployees($q, $names);
+
+        if ($matches->count() > 1) {
+            return $this->answer('Which employee?', [
+                $this->row(
+                    'I found more than one employee match: '
+                    . $matches->implode(', ')
+                    . '. Please use the full name.',
+                    'medium'
+                ),
+            ]);
+        }
+
+        if ($matches->count() === 1) {
+            $name = $matches->first();
+
+            if (
+                $isCurrentDuty
+                && !$isLast
+                && !$isCount
+                && !$this->has($q, ['today', 'ngayon', 'ngayong araw', 'yesterday', 'kahapon'])
+            ) {
+                $openShift = $this->attendanceQueryForEmployee($name)
+                    ->whereNull('time_out')
+                    ->where('time_in', '>=', now()->subHours(24))
+                    ->latest('time_in')
+                    ->first();
+
+                if ($openShift) {
+                    return $this->answer('Current duty status', [
+                        $this->row(
+                            "{$name} is currently on duty since "
+                            . $openShift->time_in->format('M j, Y g:i A')
+                            . '.',
+                            'medium',
+                            null,
+                            'On duty'
+                        ),
+                    ]);
+                }
+
+                return $this->answer('Current duty status', [
+                    $this->row(
+                        "{$name} is not currently recorded as on duty.",
+                        'low'
+                    ),
+                ]);
+            }
+
+            if ($isCount) {
+                [$label, $from, $to] = $this->range($q);
+
+                $query = $this->attendanceQueryForEmployee($name);
+
+                if ($from) {
+                    $query->where(
+                        'time_in',
+                        '>=',
+                        $from->copy()->startOfDay()
+                    );
+                }
+
+                if ($to) {
+                    $query->where(
+                        'time_in',
+                        '<=',
+                        $to->copy()->endOfDay()
+                    );
+                }
+
+                $count = $query->count();
+                $period = $from ? Str::lower($label) : 'in total';
+
+                return $this->answer('Attendance count', [
+                    $this->row(
+                        "{$name} has {$count} attendance record(s) {$period}.",
+                        'medium',
+                        null,
+                        'Attendance'
+                    ),
+                ]);
+            }
+
+            if ($isLast) {
+                $latest = $this->attendanceQueryForEmployee($name)
+                    ->latest('time_in')
+                    ->first();
+
+                if (!$latest) {
+                    return $this->answer('Attendance history', [
+                        $this->row(
+                            "No attendance records were found for {$name}.",
+                            'medium'
+                        ),
+                    ]);
+                }
+
+                return $this->answer('Last clock-in', [
+                    $this->row(
+                        'Last clock-in for ' . $name . ': '
+                        . $latest->time_in->format('M j, Y g:i A')
+                        . '.',
+                        'medium',
+                        null,
+                        'Attendance'
+                    ),
+                ]);
+            }
+
+            $isYesterday = $this->has($q, ['yesterday', 'kahapon']);
+            $asksDailyAttendance = $this->has(
+                $q,
+                ['today', 'ngayon', 'ngayong araw', 'yesterday', 'kahapon']
+            ) || $this->hasWord($q, ['ba', 'did', 'was', 'has', 'have']);
+
+            if ($asksDailyAttendance) {
+                $day = $isYesterday ? today()->subDay() : today();
+                $period = $isYesterday ? 'yesterday' : 'today';
+
+                $records = $this->attendanceQueryForEmployee($name)
+                    ->whereDate('time_in', $day->toDateString())
+                    ->orderBy('time_in')
+                    ->get();
+
+                if ($records->isEmpty()) {
+                    return $this->answer('Attendance today', [
+                        $this->row(
+                            "{$name} has no attendance record for {$period}.",
+                            'low',
+                            null,
+                            'Attendance'
+                        ),
+                    ]);
+                }
+
+                $first = $records->first();
+
+                return $this->answer('Attendance today', [
+                    $this->row(
+                        "{$name} clocked in {$period} at "
+                        . $first->time_in->format('g:i A')
+                        . '.',
+                        'medium',
+                        null,
+                        'Attendance'
+                    ),
+                    $this->row(
+                        'Attendance record(s) for '
+                        . $period
+                        . ': '
+                        . $records->count()
+                        . '.',
+                        'low'
+                    ),
+                ]);
+            }
+
+            $latest = $this->attendanceQueryForEmployee($name)
+                ->latest('time_in')
+                ->first();
+
+            if (!$latest) {
+                return $this->answer('Attendance history', [
+                    $this->row(
+                        "No attendance records were found for {$name}.",
+                        'medium'
+                    ),
+                ]);
+            }
+
+            return $this->answer('Latest attendance', [
+                $this->row(
+                    'Latest attendance record for ' . $name . ': '
+                    . $latest->time_in->format('M j, Y g:i A')
+                    . '.',
+                    'medium'
+                ),
+            ]);
+        }
+
+        // If a specific name was mentioned but is not in our records,
+        // do not silently answer with a general on-duty result.
+        if (preg_match(
+            '/\b(?:si|ni|kay|of|for)\s+([\p{L}]+)/u',
+            $q,
+            $mentioned
+        )) {
+            $askedName = $mentioned[1];
+
+            return $this->answer('Employee not found', [
+                $this->row(
+                    "No matching employee attendance record was found for "
+                    . $askedName
+                    . '.',
+                    'medium'
+                ),
+            ]);
+        }
+
+        // Preserve the existing current-duty answer for general questions.
+        if ($isCurrentDuty) {
+            return null;
+        }
+
+        if ($isCount) {
+            [$label, $from, $to] = $this->range($q);
+
+            $query = AttendanceLog::query();
+
+            if ($from) {
+                $query->where(
+                    'time_in',
+                    '>=',
+                    $from->copy()->startOfDay()
+                );
+            }
+
+            if ($to) {
+                $query->where(
+                    'time_in',
+                    '<=',
+                    $to->copy()->endOfDay()
+                );
+            }
+
+            $period = $from ? Str::lower($label) : 'in total';
+
+            return $this->answer('Attendance count', [
+                $this->row(
+                    $query->count()
+                    . " attendance record(s) {$period}.",
+                    'medium'
+                ),
+            ]);
+        }
+
+        if ($isLast) {
+            return $this->answer('Attendance history', [
+                $this->row(
+                    'Please include the employee name so I can find their last clock-in.',
+                    'medium'
+                ),
+            ]);
+        }
+
+        $isYesterday = $this->has($q, ['yesterday', 'kahapon']);
+        $day = $isYesterday ? today()->subDay() : today();
+        $period = $isYesterday ? 'yesterday' : 'today';
+
+        $records = AttendanceLog::query()
+            ->whereDate('time_in', $day->toDateString())
+            ->orderBy('time_in')
+            ->get();
+
+        if ($records->isEmpty()) {
+            return $this->answer('Attendance today', [
+                $this->row(
+                    "No attendance records were found for {$period}.",
+                    'low'
+                ),
+            ]);
+        }
+
+        $items = $records
+            ->take(6)
+            ->map(fn ($record) => $this->row(
+                $record->employee_name
+                . ' clocked in '
+                . $period
+                . ' at '
+                . $record->time_in->format('g:i A')
+                . '.',
+                'low',
+                null,
+                'Attendance'
+            ))
+            ->values()
+            ->all();
+
+        if ($records->count() > 6) {
+            $items[] = $this->row(
+                '+' . ($records->count() - 6) . ' more attendance record(s).',
+                'low'
+            );
+        }
+
+        return $this->answer('Attendance today', $items);
+    }
+
     private function hrHours(string $q): array
     {
         [$label, $from, $to] = $this->range($q);
 
-        $names = AttendanceLog::query()
-            ->distinct()
-            ->orderBy('employee_name')
-            ->pluck('employee_name');
+        // Include official employee names for ID-linked attendance,
+        // and legacy names only for attendance rows without an employee ID.
+        $names = Employee::query()
+            ->whereHas('attendanceLogs')
+            ->pluck('name')
+            ->merge(
+                AttendanceLog::query()
+                    ->whereNull('employee_id')
+                    ->whereNotNull('employee_name')
+                    ->distinct()
+                    ->orderBy('employee_name')
+                    ->pluck('employee_name')
+            )
+            ->filter()
+            ->unique()
+            ->sort()
+            ->values();
 
         if ($names->isEmpty()) {
             return $this->answer('Worked hours', [
@@ -382,8 +761,24 @@ class RobotAskController extends Controller
         }
 
         // No name at all: show everyone.
-        $byName = $this->logs(null, $from, $to)
-            ->groupBy('employee_name')
+        $allLogs = $this->logs(null, $from, $to);
+
+        $linkedEmployeeNames = Employee::query()
+            ->whereIn(
+                'id',
+                $allLogs->pluck('employee_id')->filter()->unique()->values()
+            )
+            ->pluck('name', 'id');
+
+        $byName = $allLogs
+            ->groupBy(function ($log) use ($linkedEmployeeNames) {
+                if ($log->employee_id !== null) {
+                    return $linkedEmployeeNames->get($log->employee_id)
+                        ?? $log->employee_name;
+                }
+
+                return $log->employee_name;
+            })
             ->map(fn (Collection $group) => $this->minutes($group))
             ->sortDesc();
 
@@ -406,23 +801,74 @@ class RobotAskController extends Controller
 
     private function onDuty(): array
     {
-        $onDuty = AttendanceLog::whereNull('time_out')
+        $onDuty = AttendanceLog::query()
+            ->whereNull('time_out')
             ->where('time_in', '>=', now()->subHours(24))
             ->orderBy('time_in')
             ->get();
 
-        $clockedToday = AttendanceLog::whereDate('time_in', today())
-            ->distinct()
-            ->count('employee_name');
+        $linkedEmployeeNames = Employee::query()
+            ->whereIn(
+                'id',
+                $onDuty->pluck('employee_id')->filter()->unique()->values()
+            )
+            ->pluck('name', 'id');
+
+        $todayLogs = AttendanceLog::query()
+            ->whereDate('time_in', today())
+            ->get(['employee_id', 'employee_name']);
+
+        $employeeIdsByName = Employee::query()
+            ->get(['id', 'name'])
+            ->mapWithKeys(fn (Employee $employee) => [
+                $this->normalize($employee->name) => $employee->id,
+            ]);
+
+        // Count linked rows by employee ID. For legacy rows, use the linked
+        // employee ID when the name matches; otherwise count the legacy name.
+        $clockedToday = $todayLogs
+            ->map(function ($log) use ($employeeIdsByName) {
+                if ($log->employee_id !== null) {
+                    return 'employee:' . $log->employee_id;
+                }
+
+                $legacyName = $this->normalize(
+                    (string) $log->employee_name
+                );
+
+                $linkedId = $employeeIdsByName->get($legacyName);
+
+                if ($linkedId !== null) {
+                    return 'employee:' . $linkedId;
+                }
+
+                return $legacyName !== ''
+                    ? 'legacy:' . $legacyName
+                    : null;
+            })
+            ->filter()
+            ->unique()
+            ->count();
 
         $items = [];
 
         if ($onDuty->isEmpty()) {
-            $items[] = $this->row('Nobody is clocked in right now.', 'low');
+            $items[] = $this->row(
+                'Nobody is clocked in right now.',
+                'low'
+            );
         } else {
             foreach ($onDuty as $log) {
+                $displayName = $log->employee_id !== null
+                    ? $linkedEmployeeNames->get($log->employee_id)
+                    : null;
+
+                $displayName = $displayName
+                    ?: $log->employee_name
+                    ?: 'Unknown employee';
+
                 $items[] = $this->row(
-                    "{$log->employee_name}, since " . $log->time_in->format('g:i A'),
+                    "{$displayName}, since " . $log->time_in->format('g:i A'),
                     'medium',
                     null,
                     'On duty'
@@ -430,28 +876,62 @@ class RobotAskController extends Controller
             }
         }
 
-        $items[] = $this->row("{$clockedToday} employee(s) clocked in today.", 'low');
+        $items[] = $this->row(
+            "{$clockedToday} employee(s) clocked in today.",
+            'low'
+        );
 
         return $this->answer('On duty now', $items);
     }
-
     private function hrDocuments(string $q): array
     {
-        // One employee named: show every document of that person.
-        $matches = $this->findEmployees(
-            $q,
-            EmployeeDocument::query()->distinct()->pluck('employee_name')
-        );
+        // Include employee records as well as legacy attendance/document names.
+        // This lets HR ask about employees who do not have documents yet.
+        $names = Employee::query()
+            ->pluck('name')
+            ->merge($this->employeeNames())
+            ->merge(
+                EmployeeDocument::query()
+                    ->whereNotNull('employee_name')
+                    ->distinct()
+                    ->pluck('employee_name')
+            )
+            ->filter()
+            ->unique()
+            ->sort()
+            ->values();
 
-        if ($matches->count() === 1) {
-            return $this->employeeDocuments($matches->first(), "Documents – {$matches->first()}");
+        $matches = $this->findEmployees($q, $names);
+
+        if ($matches->count() > 1) {
+            return $this->answer('Which employee?', [
+                $this->row(
+                    'I found more than one employee match: '
+                    . $matches->implode(', ')
+                    . '. Please use the full name.',
+                    'medium'
+                ),
+            ]);
         }
 
+        if ($matches->count() === 1) {
+            $name = $matches->first();
+
+            return $this->employeeDocuments(
+                $name,
+                "Documents – {$name}"
+            );
+        }
+
+        // No employee was identified: retain the general compliance summary.
         $expired = EmployeeDocument::whereDate('expiry_date', '<', today())
             ->orderBy('expiry_date')
             ->get();
 
-        $soon = EmployeeDocument::whereBetween('expiry_date', [today(), today()->addDays(30)])
+        $soon = EmployeeDocument::whereBetween(
+            'expiry_date',
+            [today(), today()->copy()->addDays(30)]
+        )
             ->orderBy('expiry_date')
             ->get();
 
@@ -477,7 +957,10 @@ class RobotAskController extends Controller
         }
 
         if ($soon->isNotEmpty()) {
-            $items[] = $this->row("{$soon->count()} expiring within 30 days", 'high');
+            $items[] = $this->row(
+                "{$soon->count()} expiring within 30 days",
+                'high'
+            );
 
             foreach ($soon->take(3) as $document) {
                 $days = (int) today()->diffInDays($document->expiry_date, true);
@@ -492,7 +975,10 @@ class RobotAskController extends Controller
         }
 
         if (!$items) {
-            $items[] = $this->row('All employee documents are valid.', 'low');
+            $items[] = $this->row(
+                'All employee documents are valid.',
+                'low'
+            );
         }
 
         return $this->answer('Document status', $items);
@@ -500,8 +986,10 @@ class RobotAskController extends Controller
 
     private function employeeNames(): Collection
     {
-        return AttendanceLog::query()->distinct()->pluck('employee_name')
+        return Employee::query()->pluck('name')
+            ->merge(AttendanceLog::query()->distinct()->pluck('employee_name'))
             ->merge(EmployeeDocument::query()->distinct()->pluck('employee_name'))
+            ->filter()
             ->unique()
             ->sort()
             ->values();
@@ -514,7 +1002,7 @@ class RobotAskController extends Controller
 
         if ($names->isEmpty()) {
             return $this->answer('Employees', [
-                $this->row('There are no employees on file yet. A person is listed as an employee once they have attendance records or documents.', 'medium'),
+                $this->row('There are no employee profiles, attendance records, or employee documents on file yet.', 'medium'),
             ]);
         }
 
@@ -528,8 +1016,8 @@ class RobotAskController extends Controller
             array_unshift(
                 $profile['items'],
                 $names->contains($person)
-                    ? $this->row('Listed as an employee: attendance records or documents are on file.', 'medium', null, 'Employee')
-                    : $this->row('Not listed as an employee: no attendance records or documents are on file.', 'medium', null, 'Employee')
+                    ? $this->row('Listed in the employee records or associated attendance/document records.', 'medium', null, 'Employee')
+                    : $this->row('Not found in the employee profiles, attendance records, or employee documents.', 'medium', null, 'Employee')
             );
 
             return $profile;
@@ -541,7 +1029,7 @@ class RobotAskController extends Controller
             ->groupBy('employee_name');
 
         $items = [
-            $this->row("{$names->count()} employee(s) on file (anyone with attendance records or documents).", 'high'),
+            $this->row("{$names->count()} person(s) on file (employee profiles, attendance records, or documents).", 'high'),
         ];
 
         foreach ($names->take(10) as $name) {
@@ -596,6 +1084,25 @@ class RobotAskController extends Controller
     {
         $items = [];
 
+        $employee = Employee::query()
+            ->where('name', $name)
+            ->first();
+
+        if ($employee) {
+            $position = $employee->position ?: 'not recorded';
+            $employmentStatus = $employee->employment_status ?: 'not recorded';
+            $dateHired = $employee->date_hired
+                ? $employee->date_hired->format('M j, Y')
+                : 'not recorded';
+
+            $items[] = $this->row(
+                "Position: {$position}; employment status: {$employmentStatus}; date hired: {$dateHired}.",
+                'medium',
+                null,
+                'Employee profile'
+            );
+        }
+
         $applications = Application::with('applicant')
             ->whereHas('applicant', fn ($query) => $query->where('name', $name))
             ->latest('id')
@@ -635,7 +1142,7 @@ class RobotAskController extends Controller
             );
         }
 
-        $logs = AttendanceLog::where('employee_name', $name)->orderBy('time_in')->get();
+        $logs = $this->attendanceQueryForEmployee($name)->orderBy('time_in')->get();
 
         if ($logs->isNotEmpty()) {
             $week = $this->minutes($this->logs($name, today()->startOfWeek(), today()->endOfWeek()));
@@ -656,7 +1163,7 @@ class RobotAskController extends Controller
             );
         }
 
-        $documents = EmployeeDocument::where('employee_name', $name)->orderBy('expiry_date')->get();
+        $documents = $this->documentQueryForEmployee($name)->orderBy('expiry_date')->get();
 
         foreach ($documents as $document) {
             $days = (int) today()->diffInDays($document->expiry_date, true);
@@ -909,9 +1416,11 @@ class RobotAskController extends Controller
         return $this->isGreeting($q) ? $this->help('Employee', 'How can I help?') : null;
     }
 
-    private function employeeDocuments(string $name, string $title = 'My documents'): array
-    {
-        $documents = EmployeeDocument::where('employee_name', $name)
+    private function employeeDocuments(
+        string $name,
+        string $title = 'My documents'
+    ): array {
+        $documents = $this->documentQueryForEmployee($name)
             ->orderBy('expiry_date')
             ->get();
 
@@ -927,11 +1436,27 @@ class RobotAskController extends Controller
             $days = (int) today()->diffInDays($document->expiry_date, true);
 
             if ($document->expiry_date->lt(today())) {
-                $items[] = $this->row("{$document->document_type}, expired {$days} day(s) ago", 'critical', null, 'Expired');
-            } elseif ($document->expiry_date->lte(today()->addDays(30))) {
-                $items[] = $this->row("{$document->document_type}, {$days} day(s) left", 'high', null, 'Expiring');
+                $items[] = $this->row(
+                    "{$document->document_type}, expired {$days} day(s) ago",
+                    'critical',
+                    null,
+                    'Expired'
+                );
+            } elseif ($document->expiry_date->lte(today()->copy()->addDays(30))) {
+                $items[] = $this->row(
+                    "{$document->document_type}, {$days} day(s) left",
+                    'high',
+                    null,
+                    'Expiring'
+                );
             } else {
-                $items[] = $this->row("{$document->document_type}, valid until " . $document->expiry_date->format('M j, Y'), 'low', null, 'Valid');
+                $items[] = $this->row(
+                    "{$document->document_type}, valid until "
+                    . $document->expiry_date->format('M j, Y'),
+                    'low',
+                    null,
+                    'Valid'
+                );
             }
         }
 
@@ -1093,12 +1618,72 @@ class RobotAskController extends Controller
         return $this->answer($title, $items);
     }
 
+    /**
+     * Prefer an employee's stable ID. Only use employee_name as a fallback
+     * for legacy rows that have no employee_id.
+     */
+    private function attendanceQueryForEmployee(string $name)
+    {
+        $employee = Employee::query()
+            ->where('name', $name)
+            ->first();
+
+        return AttendanceLog::query()->where(function ($query) use ($employee, $name) {
+            if ($employee) {
+                $query->where('employee_id', $employee->id)
+                    ->orWhere(function ($legacyQuery) use ($name) {
+                        $legacyQuery
+                            ->whereNull('employee_id')
+                            ->where('employee_name', $name);
+                    });
+            } else {
+                $query->whereNull('employee_id')
+                    ->where('employee_name', $name);
+            }
+        });
+    }
+
+    /**
+     * Use the same identity rule for documents as attendance logs.
+     */
+    private function documentQueryForEmployee(string $name)
+    {
+        $employee = Employee::query()
+            ->where('name', $name)
+            ->first();
+
+        return EmployeeDocument::query()->where(function ($query) use ($employee, $name) {
+            if ($employee) {
+                $query->where('employee_id', $employee->id)
+                    ->orWhere(function ($legacyQuery) use ($name) {
+                        $legacyQuery
+                            ->whereNull('employee_id')
+                            ->where('employee_name', $name);
+                    });
+            } else {
+                $query->whereNull('employee_id')
+                    ->where('employee_name', $name);
+            }
+        });
+    }
+
     private function logs(?string $name, ?Carbon $from, ?Carbon $to): Collection
     {
-        return AttendanceLog::query()
-            ->when($name, fn ($query) => $query->where('employee_name', $name))
-            ->when($from, fn ($query) => $query->where('time_in', '>=', $from->copy()->startOfDay()))
-            ->when($to, fn ($query) => $query->where('time_in', '<=', $to->copy()->endOfDay()))
+        $query = $name !== null
+            ? $this->attendanceQueryForEmployee($name)
+            : AttendanceLog::query();
+
+        return $query
+            ->when($from, fn ($query) => $query->where(
+                'time_in',
+                '>=',
+                $from->copy()->startOfDay()
+            ))
+            ->when($to, fn ($query) => $query->where(
+                'time_in',
+                '<=',
+                $to->copy()->endOfDay()
+            ))
             ->orderBy('time_in')
             ->get();
     }

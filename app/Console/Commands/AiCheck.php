@@ -16,15 +16,35 @@ use Illuminate\Support\Str;
 
 class AiCheck extends Command
 {
-    private const EXPECTED_VERSION = 5;
+    /**
+     * Each file maintains its own version.
+     *
+     * Update the matching entry when intentionally bumping that file's
+     * VERSION constant. Do not force every service to use the same number.
+     */
+    private const EXPECTED_VERSIONS = [
+        RuleAnswers::class => 6,
+        AttendanceAnswers::class => 5,
+        ComplianceAnswers::class => 5,
+        ApplicantAnswers::class => 5,
+        PeopleAnswers::class => 5,
+        IntentRouter::class => 5,
+        ConversationMemory::class => 5,
+        HRISAssistantService::class => 5,
+    ];
 
     protected $signature = 'ai:check {--ai : Also test the AI router (needs Ollama)}';
 
-    protected $description = 'Check that every assistant file is up to date, then run sample questions';
+    protected $description = 'Check assistant files and run sample questions';
 
     public function handle(): int
     {
-        // 1. Is every file the latest one?
+        /*
+        |--------------------------------------------------------------------------
+        | 1. Verify files and their individual versions
+        |--------------------------------------------------------------------------
+        */
+
         $files = [
             'app/Services/AI/RuleAnswers.php' => RuleAnswers::class,
             'app/Services/AI/AttendanceAnswers.php' => AttendanceAnswers::class,
@@ -47,43 +67,91 @@ class AiCheck extends Command
                 continue;
             }
 
-            $version = defined($class . '::VERSION') ? constant($class . '::VERSION') : 0;
+            $expectedVersion = self::EXPECTED_VERSIONS[$class] ?? null;
 
-            if ($version !== self::EXPECTED_VERSION) {
-                $status[] = [$path, "OLD (version {$version}, expected " . self::EXPECTED_VERSION . ')'];
+            if ($expectedVersion === null) {
+                $status[] = [$path, 'NO EXPECTED VERSION'];
                 $allGood = false;
 
                 continue;
             }
 
-            $status[] = [$path, 'OK'];
+            $versionConstant = $class . '::VERSION';
+
+            if (!defined($versionConstant)) {
+                $status[] = [$path, 'MISSING VERSION'];
+                $allGood = false;
+
+                continue;
+            }
+
+            $actualVersion = constant($versionConstant);
+
+            if ($actualVersion !== $expectedVersion) {
+                $status[] = [
+                    $path,
+                    "VERSION MISMATCH (actual {$actualVersion}, expected {$expectedVersion})",
+                ];
+
+                $allGood = false;
+
+                continue;
+            }
+
+            $status[] = [$path, "OK (v{$actualVersion})"];
         }
 
         $this->table(['File', 'Status'], $status);
 
         if (!$allGood) {
-            $this->error('Some files are missing or old. Replace the files marked MISSING or OLD with the newest version, then run this again.');
+            $this->error(
+                'Some assistant files are missing or have unexpected versions. '
+                . 'Review the files marked above before running the sample questions.'
+            );
 
             return self::FAILURE;
         }
 
-        // 2. Sample questions.
+        /*
+        |--------------------------------------------------------------------------
+        | 2. Run sample questions
+        |--------------------------------------------------------------------------
+        */
+
         $withAi = (bool) $this->option('ai');
 
-        // Without --ai nothing is sent to Ollama, so the check is fast and does not depend on the model.
+        // Without --ai, tests do not call Ollama.
         config(['ollama.enabled' => $withAi]);
 
         $assistant = app(HRISAssistantService::class);
         $session = 'check-' . uniqid();
 
         $contexts = [
-            'HR' => new AssistantContext('HR', null, null, 'dashboard', $session),
-            'Employee' => new AssistantContext('Employee', 'Juan Dela Cruz', null, 'dashboard', $session),
-            'Applicant' => new AssistantContext('Applicant', null, null, 'dashboard', $session),
+            'HR' => new AssistantContext(
+                'HR',
+                null,
+                null,
+                'dashboard',
+                $session
+            ),
+            'Employee' => new AssistantContext(
+                'Employee',
+                'Juan Dela Cruz',
+                null,
+                'dashboard',
+                $session
+            ),
+            'Applicant' => new AssistantContext(
+                'Applicant',
+                null,
+                null,
+                'dashboard',
+                $session
+            ),
         ];
 
-        // [role, question, text that must appear in the answer, needs the AI]
-        // The order matters: "siya" refers to the person of the question before it.
+        // [role, question, expected answer text, needs AI]
+        // Order matters: "siya" refers to the person discussed previously.
         $tests = [
             ['HR', 'thank you', 'welcome', false],
             ['HR', 'may late ba ngayong araw', 'no shift schedule', false],
@@ -124,37 +192,59 @@ class AiCheck extends Command
             }
 
             $started = microtime(true);
-            $result = $assistant->ask($contexts[$role], $question);
-            $ms = (int) round((microtime(true) - $started) * 1000);
+
+            $result = $assistant->ask(
+                $contexts[$role],
+                $question
+            );
+
+            $elapsedMs = (int) round(
+                (microtime(true) - $started) * 1000
+            );
 
             $lines = collect($result['items'] ?? [])->pluck('text');
 
             $haystack = Str::lower(
-                ($result['title'] ?? '') . ' ' . $lines->implode(' ') . ' ' . ($result['note'] ?? '')
+                ($result['title'] ?? '')
+                . ' '
+                . $lines->implode(' ')
+                . ' '
+                . ($result['note'] ?? '')
             );
 
-            $ok = str_contains($haystack, Str::lower($expected));
+            $ok = str_contains(
+                $haystack,
+                Str::lower($expected)
+            );
 
             $total++;
             $passed += $ok ? 1 : 0;
 
             $rows[] = [
                 $ok ? 'PASS' : 'FAIL',
-                $ms,
+                $elapsedMs,
                 $role,
                 Str::limit($question, 38),
                 Str::limit((string) $lines->first(), 70),
             ];
         }
 
-        $this->table(['Result', 'ms', 'Role', 'Question', 'Answer starts with'], $rows);
+        $this->table(
+            ['Result', 'ms', 'Role', 'Question', 'Answer starts with'],
+            $rows
+        );
 
         $this->line("{$passed} of {$total} passed.");
 
         if ($passed < $total) {
-            $this->warn('A FAIL can also mean your data is different (names, documents, dates). Send me the FAIL rows.');
+            $this->warn(
+                'A failed sample may indicate a behavior regression or different database contents. '
+                . 'Review the FAIL rows and their expected answers.'
+            );
         }
 
-        return $passed === $total ? self::SUCCESS : self::FAILURE;
+        return $passed === $total
+            ? self::SUCCESS
+            : self::FAILURE;
     }
 }
