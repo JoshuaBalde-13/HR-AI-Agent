@@ -23,7 +23,7 @@ use Illuminate\Support\Str;
 class RuleAnswers
 {
     // Bump this when the file changes. "php artisan ai:check" reads it.
-    public const VERSION = 6;
+    public const VERSION = 7;
 
     private const STATUS_LABELS = [
         'draft' => 'In progress',
@@ -57,7 +57,10 @@ class RuleAnswers
     // "How many times did I come in?" is answered from the time in / time out records.
     private const ATTENDANCE_WORDS = [
         'ilang beses', 'ilang shift', 'how many times', 'how many shifts', 'shifts',
-        'attendance', 'dtr', 'time in', 'time out', 'clock in',
+        'attendance', 'dtr', 'time in', 'time out', 'clock in', 'clocked in',
+        'pumasok', 'pumapasok', 'huling pumasok', 'kailan huling',
+        'last clock', 'last time', 'last attendance', 'on duty',
+        'naka duty', 'nasa duty', 'currently working', 'working right now',
     ];
 
     // Questions the system cannot answer because it has no shift schedule.
@@ -384,14 +387,94 @@ class RuleAnswers
             return $this->hrHours($q);
         }
 
-        // "Ilang beses pumasok si Joshua?" with a name, otherwise who is on duty.
+        // Specific attendance history takes priority over the general on-duty list.
         if ($this->has($q, self::ATTENDANCE_WORDS)) {
             $matches = $this->findEmployees($q, $this->employeeNames());
 
             if ($matches->count() === 1) {
+                $name = $matches->first();
+
+                if ($this->has($q, [
+                    'huling pumasok', 'kailan huling', 'last clock',
+                    'last time', 'last attendance',
+                ])) {
+                    $latest = $this->logs($name, null, null)
+                        ->sortByDesc('time_in')
+                        ->first();
+
+                    if (!$latest) {
+                        return $this->answer('Attendance', [
+                            $this->row(
+                                "No attendance records were found for {$name}.",
+                                'medium'
+                            ),
+                        ]);
+                    }
+
+                    return $this->answer('Attendance', [
+                        $this->row(
+                            $name . ' last clocked in on '
+                            . $latest->time_in->format('M j, Y g:i A') . '.',
+                            'high'
+                        ),
+                    ]);
+                }
+
+                $asksDailyYesNo = $this->has($q, ['pumasok', 'pumapasok'])
+                    && $this->has($q, [
+                        'today', 'ngayon', 'ngayong araw', 'yesterday', 'kahapon',
+                    ])
+                    && $this->hasWord($q, ['ba', 'did', 'was', 'has', 'have']);
+
+                if ($asksDailyYesNo) {
+                    $yesterday = $this->has($q, ['yesterday', 'kahapon']);
+                    $day = $yesterday ? today()->subDay() : today();
+                    $period = $yesterday ? 'yesterday' : 'today';
+
+                    $records = $this->logs(
+                        $name,
+                        $day->copy()->startOfDay(),
+                        $day->copy()->endOfDay()
+                    );
+
+                    if ($records->isEmpty()) {
+                        return $this->answer('Attendance', [
+                            $this->row(
+                                "{$name} was not clocked in {$period}.",
+                                'low'
+                            ),
+                        ]);
+                    }
+
+                    $first = $records->sortBy('time_in')->first();
+
+                    return $this->answer('Attendance', [
+                        $this->row(
+                            "{$name} clocked in {$period} at "
+                            . $first->time_in->format('g:i A') . '.',
+                            'high'
+                        ),
+                        $this->row(
+                            'Attendance record(s) for ' . $period . ': '
+                            . $records->count() . '.',
+                            'low'
+                        ),
+                    ]);
+                }
+
                 [$label, $from, $to] = $this->range($q);
 
-                return $this->attendanceFor($matches->first(), $label, $from, $to);
+                return $this->attendanceFor($name, $label, $from, $to);
+            }
+
+            if ($matches->count() > 1) {
+                return $this->answer('Which employee?', [
+                    $this->row(
+                        'More than one match: ' . $matches->implode(', ')
+                        . '. Please use the full name.',
+                        'medium'
+                    ),
+                ]);
             }
 
             return $this->onDuty();
@@ -417,15 +500,15 @@ class RuleAnswers
             return $this->incompleteEmployees();
         }
 
-        if ($this->has($q, self::EMPLOYEE_WORDS)) {
-            return $this->hrEmployees($q);
-        }
-
-        // A person's name in the question: answer about that person.
+        // Prefer a named-person answer over a generic employee count/list.
         $person = $this->hrPerson($q);
 
         if ($person !== null) {
             return $person;
+        }
+
+        if ($this->has($q, self::EMPLOYEE_WORDS)) {
+            return $this->hrEmployees($q);
         }
 
         if ($this->has($q, [
@@ -1158,7 +1241,10 @@ class RuleAnswers
             return 'role';
         }
 
-        if ($this->has($q, ['employment status', 'date hired', 'hire date', 'hired', 'na hire', 'nahire'])) {
+        if ($this->has($q, [
+            'employment status', 'date hired', 'hire date', 'hired', 'na hire', 'nahire',
+            'since when', 'become our employee', 'became our employee', 'employee since',
+        ])) {
             return 'employment';
         }
 
