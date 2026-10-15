@@ -20,8 +20,11 @@ return [
     // Seconds to wait for the server to accept the connection.
     'connect_timeout' => (int) env('OLLAMA_CONNECT_TIMEOUT', 3),
 
-    // Most tokens the model may write for one answer.
+    // Most tokens the model may write for a long answer.
     'max_tokens' => (int) env('OLLAMA_MAX_TOKENS', 220),
+
+    // The router only has to name an intent, so it needs very few tokens.
+    'router_tokens' => (int) env('OLLAMA_ROUTER_TOKENS', 90),
 
     // Shown to users when the AI cannot answer. It never contains technical details.
     'unavailable_message' => 'The AI assistant is temporarily unavailable. Please try again later.',

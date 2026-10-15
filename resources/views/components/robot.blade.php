@@ -18,7 +18,7 @@
 
     {{-- Speech bubble (hidden until the robot has something to announce) --}}
     <div class="robot-notice" data-robot-notice hidden>
-        <div class="robot-notice-title" data-robot-notice-title></div>
+        <div class="robot-title small" data-robot-notice-title></div>
         <div class="robot-list compact" data-robot-notice-list></div>
     </div>
 
@@ -221,7 +221,7 @@
     }
 
     @keyframes robot-row-in {
-        0%   { opacity: 0; transform: translateY(6px); }
+        0%   { opacity: 0; transform: translateY(4px); }
         100% { opacity: 1; transform: translateY(0); }
     }
 
@@ -265,14 +265,12 @@
         .robot-avatar.robot-alert,
         .robot-has-event .robot-avatar::before,
         .robot-notice,
-        .robot-item,
+        .robot-lead,
+        .robot-bullets,
+        .robot-note,
         .robot-dots span,
         .robot-typing::after {
             animation: none !important;
-        }
-
-        .robot-item {
-            opacity: 1;
         }
     }
 
@@ -309,13 +307,6 @@
         padding: 14px;
         box-shadow: 0 10px 30px rgba(0, 0, 0, 0.12);
         cursor: pointer;
-    }
-
-    .robot-notice-title {
-        font-weight: 700;
-        font-size: 14px;
-        margin-bottom: 8px;
-        min-height: 20px;
     }
 
     /* ---------- Panel ---------- */
@@ -371,92 +362,113 @@
     .robot-title {
         font-size: 15px;
         font-weight: 700;
-        margin-bottom: 12px;
-        min-height: 22px;
+        margin-bottom: 10px;
+        min-height: 20px;
     }
 
+    /* A small label above an answer */
     .robot-title.small {
-        font-size: 14px;
-        margin-bottom: 8px;
-        min-height: 18px;
+        min-height: 0;
+        margin-bottom: 6px;
+        font-size: 11px;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: #777;
     }
 
-    /* ---------- Item rows ---------- */
+    /* ---------- Answer: lead sentence + bullets ---------- */
 
     .robot-list {
-        display: flex;
-        flex-direction: column;
-        gap: 8px;
         margin-bottom: 14px;
     }
 
     .robot-list.compact {
         margin-bottom: 0;
-        gap: 6px;
     }
 
-    .robot-item {
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        padding: 10px 12px;
-        border-radius: 8px;
-        border-left: 4px solid #cfcfcf;
-        background: #f7f7f7;
-        color: #222;
-        text-decoration: none;
-        font-size: 14px;
+    .robot-lead {
+        margin-bottom: 8px;
+        font-size: 15px;
+        font-weight: 700;
         line-height: 1.4;
-        opacity: 0;
-        animation: robot-row-in 0.3s ease forwards;
+        color: #222;
+        word-break: break-word;
+        animation: robot-row-in 0.2s ease;
     }
 
-    .robot-item .body {
-        flex: 1;
-        min-width: 0;
+    .robot-list.compact .robot-lead {
+        font-size: 13px;
+        margin-bottom: 6px;
+    }
+
+    .robot-bullets {
+        list-style: none;
+        margin: 0;
+        padding: 0;
         display: flex;
         flex-direction: column;
-        gap: 2px;
+        gap: 6px;
+        animation: robot-row-in 0.2s ease;
     }
 
-    /* Small label above a row: Source, Application, Attendance... */
-    .robot-item .tag {
-        font-size: 10px;
-        font-weight: 700;
-        letter-spacing: 0.06em;
-        text-transform: uppercase;
-        color: #7a7a7a;
-    }
-
-    .robot-item .text {
+    .robot-li {
+        position: relative;
+        padding-left: 16px;
+        font-size: 14px;
+        line-height: 1.45;
+        color: #333;
         word-break: break-word;
     }
 
-    .robot-item .go {
-        flex-shrink: 0;
-        font-size: 12px;
-        font-weight: 700;
-        color: #2f6fd0;
-    }
-
-    a.robot-item:hover {
-        background: #eee;
-    }
-
-    .robot-item.level-critical { border-left-color: #e5322d; background: #fdf3f2; }
-    .robot-item.level-high     { border-left-color: #e08e0b; background: #fff8ec; }
-    .robot-item.level-medium   { border-left-color: #2f7de1; background: #f1f6fd; }
-    .robot-item.level-low      { border-left-color: #cfcfcf; background: #f7f7f7; }
-
-    .robot-list.compact .robot-item {
-        padding: 7px 10px;
+    .robot-list.compact .robot-li {
         font-size: 13px;
     }
 
+    /* The dot colour carries the priority */
+    .robot-li::before {
+        content: '';
+        position: absolute;
+        left: 2px;
+        top: 0.55em;
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: #b5b5b5;
+    }
+
+    .robot-li.level-critical::before { background: #e5322d; }
+    .robot-li.level-high::before     { background: #e08e0b; }
+    .robot-li.level-medium::before   { background: #2f7de1; }
+
+    .robot-li .tag {
+        font-weight: 700;
+        color: #555;
+    }
+
+    .go {
+        margin-left: 4px;
+        font-size: 12px;
+        font-weight: 700;
+        color: #2f6fd0;
+        text-decoration: none;
+    }
+
+    .go:hover {
+        text-decoration: underline;
+    }
+
+    .robot-note {
+        margin-top: 8px;
+        font-size: 11px;
+        color: #888;
+        animation: robot-row-in 0.2s ease;
+    }
+
     .robot-more {
+        margin-top: 6px;
+        padding-left: 16px;
         font-size: 12px;
         color: #888;
-        padding-left: 4px;
     }
 
     .robot-priority {
@@ -492,7 +504,7 @@
     .robot-chat-log {
         display: flex;
         flex-direction: column;
-        gap: 12px;
+        gap: 14px;
     }
 
     .robot-chat-log:not(:empty) {
@@ -648,23 +660,22 @@
             '(prefers-reduced-motion: reduce)'
         ).matches;
 
-        const TITLE_MS = 16; // typing speed for titles
-        const TEXT_MS = 18;  // typing speed for rows
-        const CHAT_MS = 9;   // typing speed for answers to questions
+        const TITLE_MS = 14; // typing speed, used only for the alert bubble
+        const TEXT_MS = 20; // Moderate typing speed for chat replies (~50 characters/second)
 
         const CHIPS = {
             HR: [
                 'How many applicants today?',
                 'Pending applications',
-                'Who has an interview this week?',
                 'Who is on duty now?',
                 'Any expired documents?',
-                'Worked hours this week',
+                'Which employees have incomplete documents?',
                 'What needs my attention?',
             ],
             Employee: [
                 'My worked hours this week',
-                'Total worked hours',
+                'Ilang beses na ako pumasok?',
+                'Kumpleto ba documents ko?',
                 'Which documents expire soon?',
             ],
             Applicant: [
@@ -687,7 +698,7 @@
         const listTokens = new WeakMap();
         const titleTimers = new WeakMap();
 
-        /* ---------------- Typing ---------------- */
+        /* ---------------- Typing (alert bubble only) ---------------- */
 
         function typeTitle(element, text, typing, ms = TITLE_MS) {
             const previous = titleTimers.get(element);
@@ -753,97 +764,132 @@
             });
         }
 
-        // Build one row with textContent so server text can never inject HTML
-        function buildRow(item, links) {
-            const hasLink = links && item.url;
-            const row = document.createElement(hasLink ? 'a' : 'div');
+        async function fill(element, text, container, token, typing, speed) {
+            if (typing) {
+                await typeText(element, text, container, token, speed);
+            } else {
+                element.textContent = text;
+            }
+        }
 
-            row.className = `robot-item level-${item.level || 'low'}`;
+        /* ---------------- Building an answer ---------------- */
 
-            if (hasLink) row.href = item.url;
+        // All text goes in with textContent, so server text can never inject HTML.
+        function buildLink(url) {
+            const link = document.createElement('a');
 
-            const body = document.createElement('span');
-            body.className = 'body';
+            link.className = 'go';
+            link.href = url;
+            link.textContent = 'View';
+
+            return link;
+        }
+
+        function buildLead(item, links) {
+            const element = document.createElement('div');
+            element.className = `robot-lead level-${item.level || 'low'}`;
+
+            const text = document.createElement('span');
+            text.className = 'text';
+            element.append(text);
+
+            if (links && item.url) {
+                element.append(' ', buildLink(item.url));
+            }
+
+            return { element, text };
+        }
+
+        function buildBullet(item, links) {
+            const element = document.createElement('li');
+            element.className = `robot-li level-${item.level || 'low'}`;
 
             if (item.tag) {
                 const tag = document.createElement('span');
                 tag.className = 'tag';
-                tag.textContent = item.tag;
-                body.append(tag);
+                tag.textContent = `${item.tag}:`;
+                element.append(tag, ' ');
             }
 
             const text = document.createElement('span');
             text.className = 'text';
-            body.append(text);
+            element.append(text);
 
-            row.append(body);
-
-            if (hasLink) {
-                const go = document.createElement('span');
-                go.className = 'go';
-                go.textContent = 'View';
-                row.append(go);
+            if (links && item.url) {
+                element.append(' ', buildLink(item.url));
             }
 
-            return { row, text };
+            return { element, text };
         }
 
-        async function renderItems(container, items, token, options) {
-            const {
-                links = true,
-                max = null,
-                typing = true,
-                speed = TEXT_MS,
-            } = options;
+        // Title (small label), then the direct answer, then bullets.
+        async function paint(titleElement, listElement, data, options = {}) {
+            const token = Symbol('paint');
+            const typing = options.typing === true && !reduceMotion;
+            const links = options.links !== false;
+            const speed = options.speed ?? TEXT_MS;
+            const max = options.max ?? null;
 
+            listTokens.set(listElement, token);
+            listElement.replaceChildren();
+
+            const heading = data.title || '';
+
+            titleElement.hidden = heading === '';
+
+            if (heading !== '') {
+                await typeTitle(titleElement, heading, typing, options.speed ?? TITLE_MS);
+
+                if (listTokens.get(listElement) !== token) return;
+            } else {
+                titleElement.textContent = '';
+            }
+
+            const items = Array.isArray(data.items) ? data.items : [];
             const shown = max ? items.slice(0, max) : items;
 
-            for (let index = 0; index < shown.length; index += 1) {
-                if (listTokens.get(container) !== token) return;
+            const lead = data.lead && shown.length ? shown[0] : null;
+            const bullets = lead ? shown.slice(1) : shown;
 
-                const item = shown[index];
-                const { row, text } = buildRow(item, links);
-                const animate = typing && !reduceMotion;
+            if (lead) {
+                const built = buildLead(lead, links);
+                listElement.append(built.element);
 
-                // Instant mode: rows fade in one after another.
-                if (!animate) row.style.animationDelay = `${index * 80}ms`;
+                await fill(built.text, lead.text, listElement, token, typing, speed);
 
-                container.append(row);
+                if (listTokens.get(listElement) !== token) return;
+            }
 
-                if (animate) {
-                    await typeText(text, item.text, container, token, speed);
-                } else {
-                    text.textContent = item.text;
+            if (bullets.length) {
+                const ul = document.createElement('ul');
+                ul.className = 'robot-bullets';
+                listElement.append(ul);
+
+                for (const item of bullets) {
+                    if (listTokens.get(listElement) !== token) return;
+
+                    const built = buildBullet(item, links);
+                    ul.append(built.element);
+
+                    await fill(built.text, item.text, listElement, token, typing, speed);
                 }
             }
 
-            if (listTokens.get(container) !== token) return;
+            if (listTokens.get(listElement) !== token) return;
 
             if (max && items.length > max) {
                 const more = document.createElement('div');
                 more.className = 'robot-more';
                 more.textContent = `+${items.length - max} more`;
-                container.append(more);
+                listElement.append(more);
             }
-        }
 
-        // Title first, then the rows, one by one.
-        async function paint(titleElement, listElement, data, options = {}) {
-            const token = Symbol('paint');
-
-            listTokens.set(listElement, token);
-            listElement.replaceChildren();
-
-            await typeTitle(
-                titleElement,
-                data.title,
-                options.typing !== false,
-                options.speed ?? TITLE_MS
-            );
-
-            if (listTokens.get(listElement) !== token) return;
-
-            await renderItems(listElement, data.items, token, options);
+            if (data.note) {
+                const note = document.createElement('div');
+                note.className = 'robot-note';
+                note.textContent = data.note;
+                listElement.append(note);
+            }
         }
 
         /* ---------------- Bubble ---------------- */
@@ -934,13 +980,11 @@
                     data.title + '|' + data.items.map((i) => i.text).join('|');
 
                 // Only repaint the panel when something changed.
-                // Type it only if the panel is open; otherwise it is
-                // replayed with typing the next time it opens.
                 if (signature !== currentSignature) {
                     currentSignature = signature;
-                    currentData = { title: data.title, items: data.items };
+                    currentData = { title: data.title, lead: false, items: data.items };
 
-                    paint(title, list, currentData, { typing: !panel.hidden });
+                    paint(title, list, currentData, { typing: false });
                 }
 
                 priority.textContent = data.priority.toUpperCase();
@@ -985,6 +1029,7 @@
 
                 if (!guided) {
                     listTokens.set(list, Symbol('error'));
+                    title.hidden = false;
                     title.textContent = 'The assistant is temporarily unavailable.';
                     list.replaceChildren();
                 }
@@ -998,9 +1043,8 @@
             avatar.setAttribute('aria-expanded', 'true');
             hideNotice();
 
-            // Type the current message every time the panel opens
             if (currentData) {
-                paint(title, list, currentData, { typing: true });
+                paint(title, list, currentData, { typing: false });
             }
 
             updateRobot();
@@ -1079,7 +1123,8 @@
             return element;
         }
 
-        function addAnswer(data) {
+        // Chat replies type out at a comfortable pace, with the existing thinking dots shown while waiting.
+        async function addAnswer(data) {
             const element = document.createElement('div');
             element.className = 'robot-msg bot';
 
@@ -1092,18 +1137,9 @@
             element.append(answerTitle, answerList);
             log.append(element);
 
-            // Keep the newest line in view while it types
-            const keepInView = setInterval(scrollDown, 120);
+            await paint(answerTitle, answerList, data, { typing: true, speed: TEXT_MS });
 
-            paint(
-                answerTitle,
-                answerList,
-                { title: data.title, items: data.items || [] },
-                { typing: true, speed: CHAT_MS }
-            ).finally(() => {
-                clearInterval(keepInView);
-                scrollDown();
-            });
+            scrollDown();
         }
 
         function setBusy(on) {
@@ -1149,15 +1185,16 @@
                 const data = await response.json();
 
                 thinking.remove();
-                addAnswer(data);
+                await addAnswer(data);
 
             } catch (error) {
                 console.error(error);
 
                 thinking.remove();
 
-                addAnswer({
-                    title: 'Sorry',
+                await addAnswer({
+                    title: '',
+                    lead: true,
                     items: [{
                         text: error.message === 'slow-down'
                             ? 'You are asking too fast. Please wait a moment.'
@@ -1206,12 +1243,12 @@
 
             currentSignature = signature;
             lastSignature = signature;
-            currentData = { title: data.title, items };
+            currentData = { title: data.title, lead: false, items };
 
             priority.textContent = (data.level || 'medium').toUpperCase();
             readButton.hidden = true;
 
-            paint(title, list, currentData, { typing: !panel.hidden });
+            paint(title, list, currentData, { typing: false });
 
             if (speak) announce(currentData);
         }

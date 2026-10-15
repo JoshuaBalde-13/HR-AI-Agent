@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Models\Applicant;
 use App\Models\Application;
 use App\Models\AttendanceLog;
+use App\Models\Employee;
 use App\Models\EmployeeDocument;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
@@ -41,8 +42,14 @@ class SystemKnowledge
             default => $this->applicant(),
         };
 
+        $sections['LIMITS (what this system does not have)'] = $this->limits();
+
         $rows = [];
-        $lines = ['Today is ' . now()->format('l, F j, Y') . '.'];
+
+        $lines = [
+            'Today is ' . now()->format('l, F j, Y') . '.',
+            'The LIMITS section lists what this system does not have. If the message asks for something listed there, use kind "unknown" and explain the limit.',
+        ];
 
         foreach ($sections as $title => $items) {
             $lines[] = '';
@@ -95,18 +102,30 @@ class SystemKnowledge
             $applicants['A' . ($index + 1)] = $this->applicationLine($app, true);
         }
 
-        // Employees come from attendance and from documents.
-        $names = AttendanceLog::query()->distinct()->pluck('employee_name')
+        // Employees: the employees table, plus anyone who only has attendance or documents.
+        $names = Employee::query()->pluck('name')
+            ->merge(AttendanceLog::query()->distinct()->pluck('employee_name'))
             ->merge(EmployeeDocument::query()->distinct()->pluck('employee_name'))
+            ->filter()
             ->unique()
             ->sort()
             ->values()
             ->take(12);
 
+        $records = $names->isEmpty()
+            ? collect()
+            : Employee::with('user')->whereIn('name', $names->all())->get()->keyBy('name');
+
         $logsByName = $names->isEmpty()
             ? collect()
-            : AttendanceLog::whereIn('employee_name', $names)
+            : AttendanceLog::whereIn('employee_name', $names->all())
                 ->orderBy('time_in')
+                ->get()
+                ->groupBy('employee_name');
+
+        $docsByName = $names->isEmpty()
+            ? collect()
+            : EmployeeDocument::whereIn('employee_name', $names->all())
                 ->get()
                 ->groupBy('employee_name');
 
@@ -116,8 +135,19 @@ class SystemKnowledge
             fn ($log) => $log->time_out === null && $log->time_in >= now()->subHours(24)
         );
 
+        $required = $this->requiredDocuments();
+        $incomplete = [];
+
+        foreach ($names as $name) {
+            $missing = $this->missingFrom($docsByName->get($name, collect()), $required);
+
+            if ($missing) {
+                $incomplete[] = "{$name} (missing " . implode(', ', $missing) . ')';
+            }
+        }
+
         $employeeTotals = [
-            'S4' => 'Employees on file (attendance or documents): ' . $names->count()
+            'S4' => 'Employees on file: ' . $names->count()
                 . ($names->isNotEmpty() ? ' (' . $names->implode(', ') . ')' : '') . '.',
             'S5' => 'Worked hours of all employees together: ' . $this->hoursLine($all) . '.',
             'S6' => 'On duty now: ' . ($onNow->isEmpty()
@@ -126,15 +156,26 @@ class SystemKnowledge
             'S7' => $this->topLine('this week', $logsByName, today()->startOfWeek(), today()->endOfWeek()),
             'S8' => $this->topLine('this month', $logsByName, today()->startOfMonth(), today()->endOfMonth()),
             'S9' => $this->topLine('all time', $logsByName, null, null),
+            'S11' => 'Required employee documents: ' . ($required ? implode(', ', $required) : 'none set')
+                . '. Employees missing at least one: ' . count($incomplete)
+                . ($incomplete ? ' (' . implode('; ', $incomplete) . ')' : '') . '.',
         ];
 
         $employees = [];
 
         foreach ($names as $index => $name) {
             $logs = $logsByName->get($name, collect());
+            $record = $records->get($name);
 
-            $employees['E' . ($index + 1)] = "{$name}: " . $this->hoursLine($logs)
-                . $this->dutyTail($logs) . '.';
+            $recordText = $record
+                ? "position {$record->position}; employment status {$record->employment_status}; date hired "
+                    . ($record->date_hired ? $record->date_hired->format('M j, Y') : 'not recorded')
+                    . ($record->user ? '; account role ' . $record->user->roleLabel() : '') . '; '
+                : '';
+
+            $employees['E' . ($index + 1)] = "{$name}: " . $recordText
+                . $this->hoursLine($logs) . $this->dutyTail($logs)
+                . '; ' . $this->documentsLine($docsByName->get($name, collect()), $required) . '.';
         }
 
         $docs = EmployeeDocument::orderBy('expiry_date')->get();
@@ -171,17 +212,27 @@ class SystemKnowledge
 
     /*
     |--------------------------------------------------------------------------
-    | Employee: only their own data
+    | Employee (Security Personnel): only their own data
     |--------------------------------------------------------------------------
     */
 
     private function employee(string $name): array
     {
+        $record = Employee::with('user')->where('name', $name)->first();
         $logs = AttendanceLog::where('employee_name', $name)->orderBy('time_in')->get();
+        $docs = EmployeeDocument::where('employee_name', $name)->orderBy('expiry_date')->get();
 
-        $hours = $logs->isEmpty()
-            ? ['E1' => 'You have no attendance records yet.']
-            : ['E1' => "{$name} (you): " . $this->hoursLine($logs) . $this->dutyTail($logs) . '.'];
+        $recordText = $record
+            ? "position {$record->position}; employment status {$record->employment_status}; date hired "
+                . ($record->date_hired ? $record->date_hired->format('M j, Y') : 'not recorded') . '; '
+            : '';
+
+        $hours = [
+            'E1' => "{$name} (you): " . $recordText
+                . ($logs->isEmpty()
+                    ? 'no attendance records yet'
+                    : $this->hoursLine($logs) . $this->dutyTail($logs)) . '.',
+        ];
 
         $recent = $logs->filter(fn ($log) => $log->time_out !== null)->take(-5)->values();
 
@@ -191,17 +242,13 @@ class SystemKnowledge
                 . ' (' . $this->fmt((int) round($log->time_in->diffInMinutes($log->time_out, true))) . ').';
         }
 
-        $docs = EmployeeDocument::where('employee_name', $name)->orderBy('expiry_date')->get();
-
-        $documents = [];
+        $documents = [
+            'D0' => 'Your documents: ' . $this->documentsLine($docs, $this->requiredDocuments()) . '.',
+        ];
 
         foreach ($docs->values() as $index => $doc) {
             $documents['D' . ($index + 1)] = "{$doc->document_type} expires "
                 . $doc->expiry_date->format('M j, Y') . ' (' . $this->documentState($doc) . ').';
-        }
-
-        if (!$documents) {
-            $documents['D1'] = 'You have no documents on file.';
         }
 
         return [
@@ -257,6 +304,21 @@ class SystemKnowledge
             ],
             'YOUR APPLICATION' => $mine,
             'HOW THE SYSTEM WORKS' => $guide,
+        ];
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | What the system does not have
+    |--------------------------------------------------------------------------
+    */
+
+    private function limits(): array
+    {
+        return [
+            'L1' => 'The system records only time in and time out. It has no shift schedule, so it cannot tell who is late, absent, or on overtime or undertime.',
+            'L2' => 'The system has no payroll, salary, leave or performance data.',
+            'L3' => 'Applicants confirm their 4 required documents with tick boxes. Document upload, OCR and the pre-assessment are not available yet.',
         ];
     }
 
@@ -400,6 +462,48 @@ class SystemKnowledge
         $rest = $minutes % 60;
 
         return $rest > 0 ? "{$hours} h {$rest} min" : "{$hours} h";
+    }
+
+    private function requiredDocuments(): array
+    {
+        return array_values(array_filter((array) config('hris.required_employee_documents', [])));
+    }
+
+    private function missingFrom(Collection $docs, array $required): array
+    {
+        $have = $docs->pluck('document_type')->map(fn ($type) => mb_strtolower(trim((string) $type)));
+
+        return array_values(array_filter(
+            $required,
+            fn ($type) => !$have->contains(mb_strtolower($type))
+        ));
+    }
+
+    // "documents: 3 of 4 required documents on file, missing Government ID, 1 expired, ..."
+    private function documentsLine(Collection $docs, array $required): string
+    {
+        $missing = $this->missingFrom($docs, $required);
+
+        $expired = $docs->filter(fn ($d) => $d->expiry_date->lt(today()))->count();
+
+        $soon = $docs->filter(
+            fn ($d) => $d->expiry_date->gte(today()) && $d->expiry_date->lte(today()->addDays(30))
+        )->count();
+
+        $parts = [];
+
+        if ($required) {
+            $parts[] = (count($required) - count($missing)) . ' of ' . count($required) . ' required documents on file';
+        }
+
+        if ($missing) {
+            $parts[] = 'missing ' . implode(', ', $missing);
+        }
+
+        $parts[] = "{$expired} expired";
+        $parts[] = "{$soon} expiring within 30 days";
+
+        return 'documents: ' . implode(', ', $parts);
     }
 
     private function documentState(EmployeeDocument $doc): string

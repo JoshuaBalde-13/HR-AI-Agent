@@ -6,29 +6,35 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Str;
 
 /**
- * The last 3 exchanges of a conversation, kept for one hour.
- * It lets the assistant understand follow-ups like "what about yesterday?".
+ * What the assistant remembers for one hour: the last question and the last
+ * person talked about. It lets "last week?" and "siya" make sense.
  */
 class ConversationMemory
 {
-    public function history(AssistantContext $ctx): array
+    public const VERSION = 5;
+
+    public function lastQuestion(AssistantContext $ctx): ?string
     {
-        return Cache::get($this->key($ctx), []);
+        return Cache::get($this->key($ctx, 'question'));
     }
 
-    public function remember(AssistantContext $ctx, string $question, string $reply): void
+    public function lastPerson(AssistantContext $ctx): ?string
     {
-        $key = $this->key($ctx);
-
-        $history = Cache::get($key, []);
-        $history[] = ['role' => 'user', 'text' => Str::limit($question, 200, '')];
-        $history[] = ['role' => 'assistant', 'text' => Str::limit($reply, 200, '')];
-
-        Cache::put($key, array_slice($history, -6), now()->addHour());
+        return Cache::get($this->key($ctx, 'person'));
     }
 
-    private function key(AssistantContext $ctx): string
+    public function remember(AssistantContext $ctx, string $question, ?string $person = null): void
     {
-        return "assistant-chat:{$ctx->sessionKey}:{$ctx->role}";
+        Cache::put($this->key($ctx, 'question'), Str::limit($question, 200, ''), now()->addHour());
+
+        // A person stays remembered until someone else is talked about.
+        if ($person) {
+            Cache::put($this->key($ctx, 'person'), $person, now()->addHour());
+        }
+    }
+
+    private function key(AssistantContext $ctx, string $what): string
+    {
+        return "assistant:{$ctx->sessionKey}:{$ctx->role}:{$what}";
     }
 }

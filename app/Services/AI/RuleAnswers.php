@@ -5,6 +5,7 @@ namespace App\Services\AI;
 use App\Models\Applicant;
 use App\Models\Application;
 use App\Models\AttendanceLog;
+use App\Models\Employee;
 use App\Models\EmployeeDocument;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
@@ -13,11 +14,17 @@ use Illuminate\Support\Str;
 
 /**
  * Exact, deterministic answers. Every number comes straight from the database
- * and no AI is involved. Phases 5 to 7 split this class into the applicant,
- * HR information and compliance services.
+ * and no AI is involved.
+ *
+ * Every answer has the same shape:
+ *   - the first row is the direct answer (one sentence),
+ *   - the other rows are short bullets.
  */
 class RuleAnswers
 {
+    // Bump this when the file changes. "php artisan ai:check" reads it.
+    public const VERSION = 6;
+
     private const STATUS_LABELS = [
         'draft' => 'In progress',
         'submitted' => 'Submitted',
@@ -28,11 +35,22 @@ class RuleAnswers
         'rejected' => 'Rejected',
     ];
 
+    // Checked first: "hindi natanggap" also contains "natanggap".
+    private const REJECTED_WORDS = [
+        'rejected', 'reject', 'denied', 'hindi natanggap', 'hindi tinanggap', 'hindi pumasa', 'bagsak',
+    ];
+
+    private const APPROVED_WORDS = [
+        'approved', 'approve', 'tinanggap', 'natanggap', 'nakapasa', 'pumasa',
+    ];
+
     // Specific on purpose, so a general chat question is not mistaken for data.
     private const HOURS_WORDS = [
         'worked', 'work hour', 'working hour', 'duty hour', 'total hour', 'how many hours',
         'hours of', 'hours ni', 'hours this', 'hours today', 'hours yesterday', 'my hours',
         'ilang oras', 'oras ni', 'oras ng', 'oras ang',
+        'pinakamaraming oras', 'pinakakaunting oras', 'most hours', 'least hours',
+        'fewest hours', 'highest hours',
         'nagtrabaho', 'nag trabaho', 'nagwork', 'nag work',
     ];
 
@@ -51,16 +69,35 @@ class RuleAnswers
     private const SCHEDULE_PHRASES = ['shift schedule', 'duty schedule', 'work schedule'];
 
     private const DOCUMENT_WORDS = [
-        'document', 'dokumento', 'expire', 'expiry', 'expired', 'license', 'nbi', 'medical', 'renew',
+        'document', 'dokumento', 'papeles', 'papel', 'expire', 'expiry', 'expired',
+        'license', 'nbi', 'medical', 'renew',
     ];
 
+    // Matched as whole words, so "interview completed" is not a completeness question.
     private const COMPLETENESS_WORDS = [
-        'kumpleto', 'complete', 'incomplete', 'missing', 'kulang', 'requirement',
+        'kumpleto', 'complete', 'incomplete', 'missing', 'kulang', 'requirement', 'requirements',
     ];
 
-    private const EMPLOYEE_WORDS = ['employee', 'empleyado', 'staff'];
+    private const EMPLOYEE_WORDS = ['employee', 'empleyado', 'staff', 'personnel'];
 
     private const GREETING_WORDS = ['help', 'hi', 'hello', 'hey', 'kumusta', 'tulong'];
+
+    private const THANKS_WORDS = ['thank you', 'thanks', 'thank u', 'salamat', 'tnx'];
+
+    private const BYE_WORDS = ['bye', 'goodbye', 'paalam', 'goodnight'];
+
+    private const ACK_WORDS = [
+        'ok', 'okay', 'sige', 'noted', 'got', 'it', 'ayos', 'nice', 'great',
+        'cool', 'alright', 'opo', 'po',
+    ];
+
+    private const HOWTO_WORDS = ['paano', 'how to', 'how do i', 'how can i', 'steps to'];
+
+    private const PRONOUNS = [
+        'siya', 'siyang', 'niya', 'niyang', 'nya', 'kanya', 'kanyang', 'he', 'she', 'his', 'her', 'him',
+    ];
+
+    private const PERIOD_REGEX = '/\b(today|yesterday|tomorrow|this week|this month|last week|last month|ngayong araw|ngayong linggo|ngayong buwan|nakaraang linggo|nakaraang buwan|noong isang linggo|noong isang buwan|ngayon|kahapon|bukas)\b/u';
 
     // Common words that must never count as part of a person's name.
     private const NAME_STOP = [
@@ -84,54 +121,209 @@ class RuleAnswers
 
     public function respond(string $role, string $q, array $user): ?array
     {
+        // Preserve context for short follow-up questions such as "last week?".
+        $q = $this->followUp($q, $user['previous'] ?? null);
+
+        $small = $this->smallTalk($q);
+        if ($small !== null) {
+            $small['asked'] = $q;
+            return $small;
+        }
+
+        $guide = $this->howTo($role, $q);
+        if ($guide !== null) {
+            $guide['asked'] = $q;
+            return $guide;
+        }
+
         if ($this->has($q, ['my name', 'who am i', 'sino ako', 'pangalan ko'])) {
-            return $this->identity($role, $user['name']);
+            $answer = $this->identity($role, $user['name'] ?? null);
+            $answer['asked'] = $q;
+            return $answer;
         }
 
         // Applicants and employees may only see their own information.
-        if ($role !== 'HR') {
-            $restricted = $this->restricted($role, $q, $user['name']);
-
+        if (!in_array($role, ['HR', 'HR Personnel'], true)) {
+            $restricted = $this->restricted($role, $q, $user['name'] ?? null);
             if ($restricted !== null) {
+                $restricted['asked'] = $q;
                 return $restricted;
             }
         }
 
-        return match ($role) {
-            'HR' => $this->askHr($q),
-            'Employee' => $this->askEmployee($q, $user['name']),
+        $answer = match ($role) {
+            'HR', 'HR Personnel' => $this->askHr($this->withPerson($q, $user['person'] ?? null)),
+            'Employee' => $this->askEmployee($q, $user['name'] ?? ''),
             default => $this->askApplicant($q),
         };
+
+        if ($answer !== null) {
+            $answer['asked'] = $q;
+        }
+
+        return $answer;
     }
 
-    public function help(string $role, string $title, bool $tip = true): array
+    // A short follow-up containing only a time period reuses the previous question.
+    private function followUp(string $q, ?string $previous): string
     {
-        $items = match ($role) {
+        if (!$previous || !preg_match(self::PERIOD_REGEX, $q)) {
+            return $q;
+        }
+
+        $rest = trim(preg_replace(self::PERIOD_REGEX, '', $q));
+        $rest = trim(preg_replace('/\b(naman|din|rin|pa|at|po|ba)\b/u', '', $rest));
+
+        if ($rest !== '') {
+            return $q;
+        }
+
+        return trim(preg_replace(self::PERIOD_REGEX, '', $previous) . ' ' . $q);
+    }
+
+    // Resolves pronouns such as "siya" to the last person discussed in the chat.
+    private function withPerson(string $q, ?string $last): string
+    {
+        if (!$last || !$this->hasWord($q, self::PRONOUNS)) {
+            return $q;
+        }
+
+        $people = $this->employeeNames()->merge(Applicant::query()->pluck('name'))->unique()->values();
+        if ($this->findEmployees($q, $people)->isNotEmpty()) {
+            return $q;
+        }
+
+        return $q . ' ' . $this->normalize($last);
+    }
+
+    // $lead is the first line: what went wrong, or what to try.
+    public function help(string $role, string $lead, bool $tip = true): array
+    {
+        $items = [$this->row($lead, 'medium')];
+
+        $examples = match ($role) {
             'HR' => [
-                $this->row('"How many applicants today?", "Pending applications", "Who has an interview this week?"', 'low', null, 'Applicants'),
-                $this->row('"Status ni kym mendroga", "How many employees do we have?"', 'low', null, 'People'),
-                $this->row('"Total worked hours ni Joshua", "Hours of Juan this week"', 'low', null, 'Hours'),
-                $this->row('"Who is on duty now?", "Attendance ni Juan"', 'low', null, 'Attendance'),
-                $this->row('"Any expired documents?", "Documents ni Juan"', 'low', null, 'Documents'),
-                $this->row('"What needs my attention?"', 'low', null, 'Overview'),
+                ['Applicants', '"How many applicants today?", "Pending applications", "Who has an interview this week?"'],
+                ['People', '"Status ni kym mendroga", "Anong position ni Joshua?", "How many active employees?"'],
+                ['Hours', '"Total worked hours ni Joshua", "Sino ang pinakamaraming oras?"'],
+                ['Attendance', '"Who is on duty now?", "Ilang beses pumasok si Joshua?"'],
+                ['Documents', '"Any expired documents?", "Kumpleto ba documents ni Joshua?", "Which employees have incomplete documents?"'],
+                ['Overview', '"What needs my attention?"'],
             ],
             'Employee' => [
-                $this->row('"My worked hours this week", "Total worked hours"', 'low', null, 'Hours'),
-                $this->row('"Ilang beses na ako pumasok?"', 'low', null, 'Attendance'),
-                $this->row('"Which documents expire soon?"', 'low', null, 'Documents'),
+                ['Hours', '"My worked hours this week", "Ilang beses na ako pumasok?"'],
+                ['Documents', '"Which documents expire soon?", "Kumpleto ba documents ko?"'],
+                ['Record', '"Anong position ko?"'],
             ],
             default => [
-                $this->row('"What is my application status?"', 'low', null, 'Status'),
-                $this->row('"What is my next step?"', 'low', null, 'Next step'),
-                $this->row('"When is my interview?"', 'low', null, 'Interview'),
+                ['Status', '"What is my application status?"'],
+                ['Next step', '"What is my next step?"'],
+                ['Interview', '"When is my interview?"'],
+                ['Help', '"Paano mag-apply?"'],
             ],
         };
 
-        if ($tip && config('ollama.enabled')) {
-            $items[] = $this->row('You can also ask me anything about the data in the system, in English or Filipino.', 'low', null, 'Tip');
+        foreach ($examples as [$tag, $text]) {
+            $items[] = $this->row($text, 'low', null, $tag);
         }
 
-        return $this->answer($title, $items);
+        if ($tip && config('ollama.enabled')) {
+            $items[] = $this->row('You can also type the question in your own words, in English or Filipino.', 'low', null, 'Tip');
+        }
+
+        return $this->answer('', $items);
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Small talk and step-by-step help
+    |--------------------------------------------------------------------------
+    */
+
+    private function smallTalk(string $q): ?array
+    {
+        $words = preg_split('/\s+/u', $q, -1, PREG_SPLIT_NO_EMPTY);
+
+        // Only short messages: a long question that also says thanks is a real question.
+        if (!$words || count($words) > 4) {
+            return null;
+        }
+
+        $filipino = $this->hasWord($q, ['salamat', 'sige', 'paalam', 'po', 'opo', 'ayos']);
+
+        if ($this->has($q, self::THANKS_WORDS)) {
+            return $this->answer('', [
+                $this->row($filipino
+                    ? 'Walang anuman. Sabihin mo lang kung may kailangan ka pa.'
+                    : 'You are welcome. Let me know if you need anything else.'),
+            ]);
+        }
+
+        if ($this->hasWord($q, self::BYE_WORDS)) {
+            return $this->answer('', [
+                $this->row($filipino
+                    ? 'Paalam. Nandito lang ako kung kailangan mo.'
+                    : 'Goodbye. I am here whenever you need me.'),
+            ]);
+        }
+
+        $acknowledged = collect($words)->every(fn ($word) => in_array($word, self::ACK_WORDS, true));
+
+        if ($acknowledged) {
+            return $this->answer('', [
+                $this->row($filipino
+                    ? 'Sige. Sabihin mo lang kung may kailangan ka pa.'
+                    : 'Noted. Let me know if you need anything else.'),
+            ]);
+        }
+
+        return null;
+    }
+
+    // "How do I ...?" gets fixed steps for the topics each role can use.
+    private function howTo(string $role, string $q): ?array
+    {
+        if (!$this->has($q, self::HOWTO_WORDS)) {
+            return null;
+        }
+
+        if ($role === 'Applicant' && $this->has($q, ['apply', 'application', 'aplay'])) {
+            return $this->answer('How to apply', [
+                $this->row('To apply for Security Guard:', 'medium'),
+                $this->row('1. Log in to your applicant account and click Start Application.'),
+                $this->row('2. Step 1: enter your phone number and address, then click Continue.'),
+                $this->row('3. Step 2: tick the 4 required documents (Government ID, NBI Clearance, Medical Certificate, Security Training Certificate), then click Continue.'),
+                $this->row('4. Step 3: review your details and click Submit Application.'),
+            ]);
+        }
+
+        if ($role === 'Employee' && $this->has($q, ['renew', 'document', 'expire'])) {
+            return $this->answer('How to renew a document', [
+                $this->row('To renew a document:', 'medium'),
+                $this->row('1. Open My Documents.'),
+                $this->row('2. Pick a new expiry date that is later than the current one.'),
+                $this->row('3. Click Renew. HR is notified.'),
+            ]);
+        }
+
+        if ($role === 'HR' && $this->has($q, ['compliance', 'expired', 'expiring', 'document'])) {
+            return $this->answer('How to check compliance', [
+                $this->row('To check document compliance:', 'medium'),
+                $this->row('1. Open Compliance in the side menu.'),
+                $this->row('2. Expired documents are listed first, then those expiring within 30 days.'),
+            ]);
+        }
+
+        if ($role === 'HR' && $this->has($q, ['review', 'approve', 'reject', 'applicant', 'application'])) {
+            return $this->answer('How to review an applicant', [
+                $this->row('To review an applicant:', 'medium'),
+                $this->row('1. Open Applicants in the side menu.'),
+                $this->row('2. Use the tabs (Pending, Approved, Rejected, All) and click Review on an application.'),
+                $this->row('3. Start the review, then Approve or Reject. A reason is required when rejecting.'),
+            ]);
+        }
+
+        return null;
     }
 
     /*
@@ -158,9 +350,7 @@ class RuleAnswers
             ? 'I can only provide information related to your own application and account.'
             : 'I can only provide information related to your own records.';
 
-        return $this->answer('Access restricted', [
-            $this->row($text, 'medium', null, 'Restricted'),
-        ]);
+        return $this->answer('', [$this->row($text, 'medium')]);
     }
 
     // Is a person other than the user named in the question?
@@ -201,7 +391,7 @@ class RuleAnswers
             if ($matches->count() === 1) {
                 [$label, $from, $to] = $this->range($q);
 
-                return $this->attendanceFor($matches->first(), $label, $from, $to, "Attendance – {$matches->first()}");
+                return $this->attendanceFor($matches->first(), $label, $from, $to);
             }
 
             return $this->onDuty();
@@ -223,6 +413,10 @@ class RuleAnswers
             return $this->hrDocuments($q);
         }
 
+        if ($this->asksCompleteness($q) && $this->has($q, self::EMPLOYEE_WORDS)) {
+            return $this->incompleteEmployees();
+        }
+
         if ($this->has($q, self::EMPLOYEE_WORDS)) {
             return $this->hrEmployees($q);
         }
@@ -236,8 +430,8 @@ class RuleAnswers
 
         if ($this->has($q, [
             'applicant', 'application', 'aplikante', 'aplikasyon', 'nag apply', 'nagapply',
-            'nag aapply', 'nag submit', 'pending', 'approved', 'rejected', 'interview',
-        ])) {
+            'nag aapply', 'nag submit', 'pending', 'interview',
+        ]) || $this->has($q, self::APPROVED_WORDS) || $this->has($q, self::REJECTED_WORDS)) {
             return $this->hrApplicants($q);
         }
 
@@ -247,6 +441,12 @@ class RuleAnswers
 
         return $this->isGreeting($q) ? $this->help('HR', 'How can I help?') : null;
     }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Worked hours and attendance
+    |--------------------------------------------------------------------------
+    */
 
     private function hrHours(string $q): array
     {
@@ -266,9 +466,9 @@ class RuleAnswers
         $matches = $this->findEmployees($q, $names);
 
         if ($matches->count() > 1) {
-            return $this->answer('Which employee?', [
-                $this->row('I found more than one match: ' . $matches->implode(', ') . '.', 'medium'),
-                $this->row('Please write the full name, for example "hours of ' . $matches->first() . '".'),
+            return $this->answer('Worked hours', [
+                $this->row('More than one match: ' . $matches->implode(', ') . '.', 'medium'),
+                $this->row('Write the full name, for example "hours of ' . $matches->first() . '".'),
             ]);
         }
 
@@ -280,114 +480,111 @@ class RuleAnswers
         $asked = $this->mentionedName($q);
 
         if ($asked) {
-            return $this->answer("I can't find \"{$asked}\"", [
-                $this->row('Employees with attendance records: ' . $names->implode(', ') . '.', 'medium'),
-                $this->row('Try: "Total worked hours ni ' . Str::before($names->first(), ' ') . '".'),
+            return $this->answer('Worked hours', [
+                $this->row("I can't find \"{$asked}\" among the employees with attendance records.", 'medium'),
+                $this->row('Employees with attendance: ' . $names->implode(', ') . '.'),
             ]);
         }
 
-        // No name at all: show everyone.
+        // No name at all: everyone.
         $byName = $this->logs(null, $from, $to)
             ->groupBy('employee_name')
             ->map(fn (Collection $group) => $this->minutes($group))
             ->sortDesc();
 
         if ($byName->isEmpty()) {
-            return $this->answer("Worked hours – {$label}", [
-                $this->row('No attendance records for ' . Str::lower($label) . '.', 'medium'),
+            return $this->answer('Worked hours', [
+                $this->row('No attendance records ' . ($from ? 'for ' . Str::lower($label) : 'yet') . '.', 'medium'),
             ]);
         }
 
-        $items = $byName
-            ->take(6)
-            ->map(fn ($minutes, $name) => $this->row("{$name}: " . $this->fmt((int) $minutes), 'medium', null, 'Hours'))
-            ->values()
-            ->all();
+        $when = $this->when($label, $from);
+        $ranking = $this->rankingWanted($q);
 
-        $items[] = $this->row('Everyone together: ' . $this->fmt((int) $byName->sum()), 'low', null, 'Total');
+        if ($ranking !== null && $byName->first() > 0) {
+            $top = $ranking === 'most' ? $byName->keys()->first() : $byName->keys()->last();
+            $minutes = $ranking === 'most' ? $byName->first() : $byName->last();
 
-        return $this->answer("Worked hours – {$label}", $items);
-    }
-
-    private function onDuty(): array
-    {
-        $onDuty = AttendanceLog::whereNull('time_out')
-            ->where('time_in', '>=', now()->subHours(24))
-            ->orderBy('time_in')
-            ->get();
-
-        $clockedToday = AttendanceLog::whereDate('time_in', today())
-            ->distinct()
-            ->count('employee_name');
-
-        $items = [];
-
-        if ($onDuty->isEmpty()) {
-            $items[] = $this->row('Nobody is clocked in right now.', 'low');
+            $lead = ($ranking === 'most' ? 'Most' : 'Fewest') . " worked hours {$when}: {$top} (" . $this->fmt((int) $minutes) . ').';
         } else {
-            foreach ($onDuty as $log) {
-                $items[] = $this->row(
-                    "{$log->employee_name}, since " . $log->time_in->format('g:i A'),
-                    'medium',
-                    null,
-                    'On duty'
-                );
-            }
+            $lead = 'Everyone together worked ' . $this->fmt((int) $byName->sum()) . " {$when}.";
         }
 
-        $items[] = $this->row("{$clockedToday} employee(s) clocked in today.", 'low');
+        $items = [$this->row($lead, 'high')];
 
-        return $this->answer('On duty now', $items);
-    }
-
-    // "Was Joshua late?": the system only has time in and time out, no schedule.
-    private function scheduleQuestion(string $q): array
-    {
-        $matches = $this->findEmployees($q, $this->employeeNames());
-
-        if ($matches->count() !== 1) {
-            return $this->answer('Attendance', [$this->scheduleNote()]);
+        foreach ($byName->take(6) as $name => $minutes) {
+            $items[] = $this->row("{$name}: " . $this->fmt((int) $minutes));
         }
 
-        $name = $matches->first();
-
-        $result = $this->attendanceFor($name, 'All time', null, null, "Attendance – {$name}");
-
-        array_unshift($result['items'], $this->scheduleNote());
-
-        return $result;
+        return $this->answer('Worked hours', $items);
     }
 
-    private function scheduleNote(): array
+    private function rankingWanted(string $q): ?string
     {
-        return $this->row(
-            'The system only records time in and time out. It has no shift schedule, so I cannot tell whether someone was late, absent, or on overtime or undertime.',
-            'medium',
-            null,
-            'Not available'
-        );
+        if ($this->has($q, ['pinakakaunti', 'pinakakaunting', 'least', 'fewest', 'lowest'])) {
+            return 'least';
+        }
+
+        if (
+            $this->has($q, ['pinakamaraming', 'pinakamarami', 'most hours', 'highest'])
+            || $this->hasWord($q, ['most', 'top'])
+        ) {
+            return 'most';
+        }
+
+        return null;
     }
 
-    // How many shifts, and the last five time in / time out records.
-    private function attendanceFor(string $name, string $label, ?Carbon $from, ?Carbon $to, string $title): array
+    private function hoursFor(string $name, string $label, ?Carbon $from, ?Carbon $to, bool $self = false): array
     {
+        $subject = $self ? 'You' : $name;
         $logs = $this->logs($name, $from, $to);
 
         if ($logs->isEmpty()) {
-            return $this->answer($title, [
-                $this->row('No attendance records for ' . Str::lower($label) . '.', 'medium'),
+            return $this->answer('Worked hours', [
+                $this->row("No attendance records found for {$subject}" . ($from ? ' ' . Str::lower($label) : '') . '.', 'medium'),
+            ]);
+        }
+
+        $closed = $logs->filter(fn ($log) => $log->time_out !== null);
+
+        $items = [
+            $this->row(
+                "{$subject} worked " . $this->fmt($this->minutes($closed)) . ' ' . $this->when($label, $from)
+                    . " ({$closed->count()} shift(s)).",
+                'high'
+            ),
+        ];
+
+        if ($from === null) {
+            $items[] = $this->row('This month: ' . $this->fmt($this->minutes($this->logs($name, today()->startOfMonth(), today()->endOfMonth()))));
+            $items[] = $this->row('This week: ' . $this->fmt($this->minutes($this->logs($name, today()->startOfWeek(), today()->endOfWeek()))));
+        } else {
+            $items[] = $this->row('In total: ' . $this->fmt($this->minutes($this->logs($name, null, null))));
+        }
+
+        return $this->answer('Worked hours', array_merge($items, $this->dutyNotes($logs)));
+    }
+
+    // How many shifts, and the last five time in / time out records.
+    private function attendanceFor(string $name, string $label, ?Carbon $from, ?Carbon $to, bool $self = false): array
+    {
+        $subject = $self ? 'You' : $name;
+        $logs = $this->logs($name, $from, $to);
+
+        if ($logs->isEmpty()) {
+            return $this->answer('Attendance', [
+                $this->row("No attendance records found for {$subject}" . ($from ? ' ' . Str::lower($label) : '') . '.', 'medium'),
             ]);
         }
 
         $finished = $logs->filter(fn ($log) => $log->time_out !== null)->count();
-        $when = $from ? Str::lower($label) : 'in total';
 
         $items = [
             $this->row(
-                "{$finished} finished shift(s) {$when}, " . $this->fmt($this->minutes($logs)) . ' worked.',
-                'high',
-                null,
-                'Attendance'
+                $subject . ($self ? ' have ' : ' has ') . "{$finished} finished shift(s) " . $this->when($label, $from)
+                    . ', ' . $this->fmt($this->minutes($logs)) . ' worked.',
+                'high'
             ),
         ];
 
@@ -400,15 +597,10 @@ class RuleAnswers
                 ? ' (' . $this->fmt((int) round($log->time_in->diffInMinutes($log->time_out, true))) . ')'
                 : '';
 
-            $items[] = $this->row(
-                $log->time_in->format('M j') . ': in ' . $log->time_in->format('g:i A') . ', out ' . $out . $length,
-                'low',
-                null,
-                'Record'
-            );
+            $items[] = $this->row($log->time_in->format('M j') . ': in ' . $log->time_in->format('g:i A') . ', out ' . $out . $length);
         }
 
-        return $this->answer($title, $items);
+        return $this->answer('Attendance', $items);
     }
 
     // A recent open record means on duty now. An old one is a missing time out.
@@ -422,10 +614,8 @@ class RuleAnswers
 
         if ($open) {
             $notes[] = $this->row(
-                'Currently on duty since ' . $open->time_in->format('M j, g:i A') . ' (not counted yet)',
-                'medium',
-                null,
-                'On duty'
+                'On duty now since ' . $open->time_in->format('M j, g:i A') . ' (not counted yet).',
+                'medium'
             );
         }
 
@@ -433,118 +623,388 @@ class RuleAnswers
 
         if ($stale->isNotEmpty()) {
             $notes[] = $this->row(
-                "{$stale->count()} record(s) have no time out and are not counted, for example the one from "
+                "Data note: {$stale->count()} record(s) have no time out and are not counted, for example the one from "
                     . $stale->first()->time_in->format('M j, g:i A') . '.',
-                'medium',
-                null,
-                'Data note'
+                'medium'
             );
         }
 
         return $notes;
     }
 
+    private function onDuty(): array
+    {
+        $onDuty = AttendanceLog::whereNull('time_out')
+            ->where('time_in', '>=', now()->subHours(24))
+            ->orderBy('time_in')
+            ->get();
+
+        $clockedToday = AttendanceLog::whereDate('time_in', today())
+            ->distinct()
+            ->count('employee_name');
+
+        if ($onDuty->isEmpty()) {
+            return $this->answer('On duty', [
+                $this->row('Nobody is on duty right now.', 'low'),
+                $this->row("{$clockedToday} employee(s) clocked in today."),
+            ]);
+        }
+
+        $items = [$this->row("{$onDuty->count()} on duty now.", 'high')];
+
+        foreach ($onDuty as $log) {
+            $items[] = $this->row("{$log->employee_name}, since " . $log->time_in->format('g:i A'), 'medium');
+        }
+
+        $items[] = $this->row("{$clockedToday} employee(s) clocked in today.");
+
+        return $this->answer('On duty', $items);
+    }
+
+    // "Was Joshua late?": the system only has time in and time out, no schedule.
+    private function scheduleQuestion(string $q): array
+    {
+        $matches = $this->findEmployees($q, $this->employeeNames());
+
+        if ($matches->count() !== 1) {
+            return $this->answer('Attendance', $this->scheduleNotes());
+        }
+
+        $records = $this->attendanceFor($matches->first(), 'All time', null, null);
+
+        return $this->answer('Attendance', array_merge($this->scheduleNotes(), $records['items']));
+    }
+
+    private function scheduleNotes(): array
+    {
+        return [
+            $this->row('The system has no shift schedule, so it cannot tell who is late, absent, or on overtime or undertime.', 'medium'),
+            $this->row('It only records time in and time out.'),
+        ];
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Documents and completeness
+    |--------------------------------------------------------------------------
+    */
+
+    private function asksCompleteness(string $q): bool
+    {
+        return $this->hasWord($q, self::COMPLETENESS_WORDS);
+    }
+
     private function hrDocuments(string $q): array
     {
-        $asksCompleteness = $this->has($q, self::COMPLETENESS_WORDS);
+        $asksCompleteness = $this->asksCompleteness($q);
 
-        // One person named: show every document of that person.
+        // One person named: that person only.
         $matches = $this->findEmployees($q, $this->employeeNames());
 
         if ($matches->count() === 1) {
             $name = $matches->first();
-            $result = $this->employeeDocuments($name, "Documents – {$name}");
 
-            if ($asksCompleteness) {
-                $result['items'][] = $this->completenessNote();
-            }
+            return $asksCompleteness
+                ? $this->personCompleteness($name)
+                : $this->employeeDocuments($name);
+        }
 
-            return $result;
+        // "Which employees have incomplete documents?"
+        if ($asksCompleteness) {
+            return $this->incompleteEmployees();
         }
 
         $total = EmployeeDocument::count();
 
         if ($total === 0) {
-            $items = [
+            return $this->answer('Documents', [
                 $this->row('No employee documents are on file yet, so there is nothing to check.', 'medium'),
-            ];
-
-            if ($asksCompleteness) {
-                $items[] = $this->completenessNote();
-            }
-
-            return $this->answer('Document status', $items);
+            ]);
         }
+
+        [$windowLabel, $end] = $this->expiryWindow($q);
+        $urgent = (int) config('hris.urgent_days', 7);
 
         $expired = EmployeeDocument::whereDate('expiry_date', '<', today())
             ->orderBy('expiry_date')
             ->get();
 
-        $soon = EmployeeDocument::whereBetween('expiry_date', [today(), today()->addDays(30)])
+        $soon = EmployeeDocument::whereDate('expiry_date', '>=', today())
+            ->whereDate('expiry_date', '<=', $end)
             ->orderBy('expiry_date')
             ->get();
 
-        $items = [];
+        if ($expired->isEmpty() && $soon->isEmpty()) {
+            return $this->answer('Documents', [
+                $this->row("No document is expired or expires {$windowLabel}. {$total} document(s) on file.", 'low'),
+            ]);
+        }
+
+        $parts = [];
 
         if ($expired->isNotEmpty()) {
-            $items[] = $this->row(
-                "{$expired->count()} expired document(s)",
-                'critical',
-                route('hr.compliance')
-            );
-
-            foreach ($expired->take(3) as $document) {
-                $days = (int) $document->expiry_date->diffInDays(today(), true);
-
-                $items[] = $this->row(
-                    "{$document->employee_name}, {$document->document_type} ({$days} day(s) overdue)",
-                    'high',
-                    null,
-                    'Expired'
-                );
-            }
+            $parts[] = "{$expired->count()} expired";
         }
 
         if ($soon->isNotEmpty()) {
-            $items[] = $this->row("{$soon->count()} expiring within 30 days", 'high');
+            $parts[] = "{$soon->count()} expiring {$windowLabel}";
+        }
 
-            foreach ($soon->take(3) as $document) {
-                $days = (int) today()->diffInDays($document->expiry_date, true);
+        $hasUrgent = $soon->contains(
+            fn ($document) => (int) today()->diffInDays($document->expiry_date, true) <= $urgent
+        );
 
-                $items[] = $this->row(
-                    "{$document->employee_name}, {$document->document_type} ({$days} day(s) left)",
-                    'medium',
-                    null,
-                    'Expiring'
-                );
+        $items = [
+            $this->row(
+                'Documents: ' . implode(' and ', $parts) . '.',
+                $expired->isNotEmpty() ? 'critical' : ($hasUrgent ? 'high' : 'medium'),
+                route('hr.compliance')
+            ),
+        ];
+
+        foreach ($expired->take(5) as $document) {
+            $days = (int) $document->expiry_date->diffInDays(today(), true);
+
+            $items[] = $this->row("{$document->employee_name}: {$document->document_type}, expired {$days} day(s) ago", 'high');
+        }
+
+        foreach ($soon->take(5) as $document) {
+            $days = (int) today()->diffInDays($document->expiry_date, true);
+
+            $items[] = $this->row(
+                "{$document->employee_name}: {$document->document_type}, {$days} day(s) left",
+                $days <= $urgent ? 'high' : 'medium'
+            );
+        }
+
+        return $this->answer('Documents', $items);
+    }
+
+    // Returns [label, last day]. "within 30 days" unless the question says otherwise.
+    private function expiryWindow(string $q): array
+    {
+        if (preg_match('/(?:within|sa loob ng|next|susunod na)\s+(\d{1,3})\s+(?:days?|araw)/u', $q, $match)) {
+            $days = max(1, min(365, (int) $match[1]));
+
+            return ["within {$days} days", today()->addDays($days)];
+        }
+
+        if ($this->has($q, ['this month', 'ngayong buwan'])) {
+            return ['this month', today()->endOfMonth()];
+        }
+
+        if ($this->has($q, ['this week', 'ngayong linggo'])) {
+            return ['this week', today()->endOfWeek()];
+        }
+
+        $days = (int) config('hris.warning_days', 30);
+
+        return ["within {$days} days", today()->addDays($days)];
+    }
+
+    private function requiredDocuments(): array
+    {
+        return array_values(array_filter((array) config('hris.required_employee_documents', [])));
+    }
+
+    // The required document types that are not in $types.
+    private function missingFrom(Collection $types, array $required): array
+    {
+        $have = $types->map(fn ($type) => mb_strtolower(trim((string) $type)));
+
+        return array_values(array_filter(
+            $required,
+            fn ($type) => !$have->contains(mb_strtolower($type))
+        ));
+    }
+
+    // name => list of missing required documents, only for employees that miss something.
+    private function incompleteList(): Collection
+    {
+        $required = $this->requiredDocuments();
+
+        if (!$required) {
+            return collect();
+        }
+
+        $types = EmployeeDocument::query()
+            ->get(['employee_name', 'document_type'])
+            ->groupBy('employee_name')
+            ->map(fn (Collection $group) => $group->pluck('document_type'));
+
+        $list = collect();
+
+        foreach ($this->employeeNames() as $name) {
+            $missing = $this->missingFrom($types->get($name, collect()), $required);
+
+            if ($missing) {
+                $list->put($name, $missing);
             }
         }
 
-        if (!$items) {
-            $items[] = $this->row("All {$total} document(s) on file are valid.", 'low');
-        }
-
-        if ($asksCompleteness) {
-            $items[] = $this->completenessNote();
-        }
-
-        return $this->answer('Document status', $items);
+        return $list;
     }
 
-    private function completenessNote(): array
+    private function incompleteEmployees(): array
     {
-        return $this->row(
-            'The system does not define which documents are required yet, so I can only show what is on file. I cannot tell what is missing.',
-            'low',
-            null,
-            'Note'
-        );
+        $required = $this->requiredDocuments();
+
+        if (!$required) {
+            return $this->answer('Incomplete documents', [
+                $this->row('No required documents are set yet. Add them in config/hris.php.', 'medium'),
+            ]);
+        }
+
+        if ($this->employeeNames()->isEmpty()) {
+            return $this->answer('Incomplete documents', [
+                $this->row('There are no employees on file yet.', 'medium'),
+            ]);
+        }
+
+        $list = $this->incompleteList();
+
+        if ($list->isEmpty()) {
+            return $this->answer('Incomplete documents', [
+                $this->row('Every employee has all ' . count($required) . ' required documents on file.', 'low'),
+            ]);
+        }
+
+        $items = [
+            $this->row("{$list->count()} employee(s) are missing required documents.", 'high', route('hr.compliance')),
+        ];
+
+        foreach ($list->take(8) as $name => $missing) {
+            $items[] = $this->row("{$name}: " . implode(', ', $missing), 'medium');
+        }
+
+        if ($list->count() > 8) {
+            $items[] = $this->row('+' . ($list->count() - 8) . ' more');
+        }
+
+        $items[] = $this->row('Required: ' . implode(', ', $required) . '.');
+
+        return $this->answer('Incomplete documents', $items);
     }
 
+    // "Is Joshua's record complete?"
+    private function personCompleteness(string $name, bool $self = false): array
+    {
+        $required = $this->requiredDocuments();
+
+        if (!$required) {
+            return $this->answer('Documents', [
+                $this->row('No required documents are set yet. Add them in config/hris.php.', 'medium'),
+            ]);
+        }
+
+        $documents = EmployeeDocument::where('employee_name', $name)->orderBy('expiry_date')->get();
+        $missing = $this->missingFrom($documents->pluck('document_type'), $required);
+        $urgent = (int) config('hris.urgent_days', 7);
+        $warning = (int) config('hris.warning_days', 30);
+
+        $items = [
+            $this->row(
+                ($self ? 'You have ' : "{$name} has ") . (count($required) - count($missing)) . ' of ' . count($required) . ' required documents.',
+                $missing ? 'high' : 'low'
+            ),
+        ];
+
+        foreach ($missing as $type) {
+            $items[] = $this->row("Missing: {$type}", 'high');
+        }
+
+        $issues = 0;
+
+        foreach ($documents as $document) {
+            $days = (int) today()->diffInDays($document->expiry_date, true);
+
+            if ($document->expiry_date->lt(today())) {
+                $items[] = $this->row("Expired: {$document->document_type}, {$days} day(s) ago", 'critical');
+                $issues++;
+            } elseif ($document->expiry_date->lte(today()->addDays($warning))) {
+                $items[] = $this->row("Expiring: {$document->document_type}, {$days} day(s) left", $days <= $urgent ? 'high' : 'medium');
+                $issues++;
+            }
+        }
+
+        if (!$missing && $issues === 0) {
+            $items[] = $this->row('Nothing is missing, expired, or about to expire.');
+        }
+
+        return $this->answer('Documents', $items);
+    }
+
+    private function employeeDocuments(string $name, bool $self = false): array
+    {
+        $documents = EmployeeDocument::where('employee_name', $name)->orderBy('expiry_date')->get();
+
+        if ($documents->isEmpty()) {
+            return $this->answer('Documents', [
+                $this->row(($self ? 'You have' : "{$name} has") . ' no documents on file yet.', 'medium'),
+            ]);
+        }
+
+        $urgent = (int) config('hris.urgent_days', 7);
+        $warning = (int) config('hris.warning_days', 30);
+
+        $expired = $documents->filter(fn ($d) => $d->expiry_date->lt(today()))->count();
+
+        $soon = $documents->filter(
+            fn ($d) => $d->expiry_date->gte(today()) && $d->expiry_date->lte(today()->addDays($warning))
+        )->count();
+
+        $valid = $documents->count() - $expired - $soon;
+
+        $bits = [];
+
+        if ($expired) {
+            $bits[] = "{$expired} expired";
+        }
+
+        if ($soon) {
+            $bits[] = "{$soon} expiring within {$warning} days";
+        }
+
+        if ($valid) {
+            $bits[] = "{$valid} valid";
+        }
+
+        $items = [
+            $this->row(
+                ($self ? 'Your documents: ' : "Documents of {$name}: ") . implode(', ', $bits) . '.',
+                $expired ? 'critical' : ($soon ? 'medium' : 'low')
+            ),
+        ];
+
+        foreach ($documents as $document) {
+            $days = (int) today()->diffInDays($document->expiry_date, true);
+
+            if ($document->expiry_date->lt(today())) {
+                $items[] = $this->row("{$document->document_type}: expired {$days} day(s) ago", 'critical');
+            } elseif ($document->expiry_date->lte(today()->addDays($warning))) {
+                $items[] = $this->row("{$document->document_type}: {$days} day(s) left", $days <= $urgent ? 'high' : 'medium');
+            } else {
+                $items[] = $this->row("{$document->document_type}: valid until " . $document->expiry_date->format('M j, Y'));
+            }
+        }
+
+        return $this->answer('Documents', $items);
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Employees and people
+    |--------------------------------------------------------------------------
+    */
+
+    // Everyone who is an employee: the employees table, plus anyone who only
+    // appears in attendance or documents (older records).
     private function employeeNames(): Collection
     {
-        return AttendanceLog::query()->distinct()->pluck('employee_name')
+        return Employee::query()->pluck('name')
+            ->merge(AttendanceLog::query()->distinct()->pluck('employee_name'))
             ->merge(EmployeeDocument::query()->distinct()->pluck('employee_name'))
+            ->filter()
             ->unique()
             ->sort()
             ->values();
@@ -557,7 +1017,7 @@ class RuleAnswers
 
         if ($names->isEmpty()) {
             return $this->answer('Employees', [
-                $this->row('There are no employees on file yet. A person is listed as an employee once they have attendance records or documents.', 'medium'),
+                $this->row('There are no employees on file yet.', 'medium'),
             ]);
         }
 
@@ -566,44 +1026,65 @@ class RuleAnswers
 
         if ($matches->count() === 1) {
             $person = $matches->first();
-            $profile = $this->personProfile($person, $this->personFocus($q));
+            $focus = $this->personFocus($q);
 
-            array_unshift(
-                $profile['items'],
-                $names->contains($person)
-                    ? $this->row('Listed as an employee: attendance records or documents are on file.', 'medium', null, 'Employee')
-                    : $this->row('Not listed as an employee: no attendance records or documents are on file.', 'medium', null, 'Employee')
-            );
+            if ($focus !== null) {
+                return $this->personProfile($person, $focus);
+            }
 
-            return $profile;
+            $employee = Employee::where('name', $person)->first();
+
+            $lead = $names->contains($person)
+                ? "Yes, {$person} is an employee" . ($employee ? " ({$employee->position}, {$employee->employment_status})" : '') . '.'
+                : "No, {$person} is not listed as an employee.";
+
+            return $this->personProfile($person, null, $lead);
         }
 
-        $logs = AttendanceLog::whereIn('employee_name', $names)
+        $records = Employee::query()->whereIn('name', $names->all())->get()->keyBy('name');
+
+        // "How many active employees do we have?"
+        if ($this->has($q, ['active', 'aktibo'])) {
+            $active = $records->filter(
+                fn ($employee) => mb_strtolower((string) $employee->employment_status) === 'active'
+            );
+
+            $items = [
+                $this->row("{$active->count()} active employee(s) out of {$records->count()} on record.", 'high'),
+            ];
+
+            foreach ($active->take(10) as $employee) {
+                $items[] = $this->row("{$employee->name}, {$employee->position}");
+            }
+
+            return $this->answer('Employees', $items);
+        }
+
+        $logs = AttendanceLog::whereIn('employee_name', $names->all())
             ->orderBy('time_in')
             ->get()
             ->groupBy('employee_name');
 
-        $items = [
-            $this->row("{$names->count()} employee(s) on file (anyone with attendance records or documents).", 'high'),
-        ];
+        $items = [$this->row("{$names->count()} employee(s) on file.", 'high')];
 
         foreach ($names->take(10) as $name) {
             $own = $logs->get($name, collect());
+            $record = $records->get($name);
 
             $open = $own
                 ->filter(fn ($log) => $log->time_out === null && $log->time_in >= now()->subHours(24))
                 ->last();
 
             $items[] = $this->row(
-                "{$name}: total " . $this->fmt($this->minutes($own)) . ($open ? ', on duty now' : ''),
-                'low',
-                null,
-                'Employee'
+                $name
+                    . ($record ? ", {$record->position} ({$record->employment_status})" : '')
+                    . ': ' . $this->fmt($this->minutes($own)) . ' worked'
+                    . ($open ? ', on duty now' : '')
             );
         }
 
         if ($names->count() > 10) {
-            $items[] = $this->row('+' . ($names->count() - 10) . ' more', 'low');
+            $items[] = $this->row('+' . ($names->count() - 10) . ' more');
         }
 
         return $this->answer('Employees', $items);
@@ -621,22 +1102,55 @@ class RuleAnswers
         $matches = $this->findEmployees($q, $people);
 
         if ($matches->count() === 1) {
-            return $this->personProfile($matches->first(), $this->personFocus($q));
+            $name = $matches->first();
+            $focus = $this->personFocus($q);
+
+            // "May applicant ba tayong Kym?": say plainly that the person is on file.
+            $lead = ($focus === null && $this->asksExistence($q)) ? $this->existenceText($name) : null;
+
+            return $this->personProfile($name, $focus, $lead);
         }
 
         if ($matches->count() > 1) {
-            return $this->answer('Which person?', [
+            return $this->answer('People', [
                 $this->row('More than one match: ' . $matches->implode(', ') . '.', 'medium'),
-                $this->row('Please write the full name, for example "' . $matches->first() . '".', 'low'),
+                $this->row('Write the full name, for example "' . $matches->first() . '".'),
             ]);
         }
 
         return null;
     }
 
+    private function asksExistence(string $q): bool
+    {
+        return $this->hasWord($q, ['may', 'meron', 'mayroon', 'merong', 'mayroong'])
+            || $this->has($q, ['is there', 'do we have', 'are there', 'exists']);
+    }
+
+    private function existenceText(string $name): string
+    {
+        $kinds = [];
+
+        if (Applicant::where('name', $name)->exists()) {
+            $kinds[] = 'an applicant';
+        }
+
+        if ($this->employeeNames()->contains($name)) {
+            $kinds[] = 'an employee';
+        }
+
+        return $kinds
+            ? "Yes, {$name} is on file as " . implode(' and ', $kinds) . '.'
+            : "No record of {$name} was found.";
+    }
+
     // What the question wants to know about the person, so the answer can be direct.
     private function personFocus(string $q): ?string
     {
+        if ($this->asksCompleteness($q)) {
+            return 'completeness';
+        }
+
         if (
             $this->hasWord($q, ['role', 'position'])
             || $this->has($q, ['posisyon', 'job title', 'anong trabaho', 'ano trabaho', 'designation'])
@@ -644,7 +1158,15 @@ class RuleAnswers
             return 'role';
         }
 
-        if ($this->has($q, ['approved', 'approve', 'rejected', 'reject', 'decision', 'decided', 'desisyon', 'tinanggap'])) {
+        if ($this->has($q, ['employment status', 'date hired', 'hire date', 'hired', 'na hire', 'nahire'])) {
+            return 'employment';
+        }
+
+        if (
+            $this->has($q, self::REJECTED_WORDS)
+            || $this->has($q, self::APPROVED_WORDS)
+            || $this->has($q, ['decision', 'decided', 'desisyon'])
+        ) {
             return 'decision';
         }
 
@@ -664,25 +1186,96 @@ class RuleAnswers
             ->get();
     }
 
-    // The system stores no role or position for employees yet.
+    private function applicationSummary(Application $application): string
+    {
+        $status = self::STATUS_LABELS[$application->status] ?? $application->status;
+        $parts = ["{$application->job_title}: {$status}"];
+
+        if ($application->status === 'draft') {
+            $parts[] = 'form step ' . (int) $application->step . ' of 3';
+        }
+
+        if ($application->submitted_at) {
+            $parts[] = 'submitted ' . $application->submitted_at->format('M j, Y g:i A');
+        }
+
+        if ($application->interview_at) {
+            $parts[] = 'interview ' . Carbon::parse($application->interview_at)->format('M j, Y g:i A')
+                . ($application->interview_location ? ' at ' . $application->interview_location : '');
+        }
+
+        if ($application->reviewed_at) {
+            $parts[] = 'decided ' . $application->reviewed_at->format('M j, Y g:i A');
+        }
+
+        if ($application->remarks) {
+            $parts[] = 'HR remarks: ' . Str::limit($application->remarks, 80);
+        }
+
+        return implode('; ', $parts) . '.';
+    }
+
+    private function applicationUrl(Application $application): ?string
+    {
+        return $application->status === 'draft' ? null : route('hr.applicants.show', $application);
+    }
+
+    // The employee record: position, employment status, date hired.
+    private function employmentAnswer(string $name, bool $self): array
+    {
+        $employee = Employee::with('user')->where('name', $name)->first();
+
+        if (!$employee) {
+            return $this->answer('Employment', [
+                $this->row(($self ? 'Your' : "The") . ' employment record is not on file, so no position is stored.', 'medium'),
+            ]);
+        }
+
+        $items = [
+            $this->row(
+                ($self ? 'Your position' : "Position of {$name}") . ": {$employee->position}; employment status: {$employee->employment_status}; date hired: "
+                    . ($employee->date_hired ? $employee->date_hired->format('M j, Y') : 'not recorded') . '.',
+                'high'
+            ),
+        ];
+
+        if ($employee->user) {
+            $items[] = $this->row('System account role: ' . $employee->user->roleLabel() . '.');
+        }
+
+        return $this->answer('Employment', $items);
+    }
+
+    // "Anong role ni Joshua?"
     private function personRole(string $name): array
     {
-        $items = [
-            $this->row('The system does not store a role or position for employees yet.', 'medium', null, 'Not available'),
-        ];
+        $employee = Employee::with('user')->where('name', $name)->first();
+
+        if ($employee) {
+            $items = [
+                $this->row(
+                    "{$name} is a {$employee->position} ({$employee->employment_status}), "
+                        . ($employee->date_hired ? 'hired ' . $employee->date_hired->format('M j, Y') : 'date hired not recorded') . '.',
+                    'high'
+                ),
+            ];
+
+            if ($employee->user) {
+                $items[] = $this->row('System account role: ' . $employee->user->roleLabel() . '.');
+            }
+        } else {
+            $items = [
+                $this->row("{$name} is not on file as an employee, so no position is recorded.", 'medium'),
+            ];
+        }
 
         foreach ($this->applicationsOf($name) as $application) {
             $status = self::STATUS_LABELS[$application->status] ?? $application->status;
 
-            $items[] = $this->row(
-                "Applied for {$application->job_title}, status {$status}.",
-                'low',
-                $application->status === 'draft' ? null : route('hr.applicants.show', $application),
-                'Application'
-            );
+            $items[] = $this->row("Applied for {$application->job_title}: {$status}.", 'low', $this->applicationUrl($application));
         }
 
-        return $this->answer("Role – {$name}", $items);
+        return $this->answer('Role', $items);
     }
 
     // "When was Joshua approved?"
@@ -691,7 +1284,7 @@ class RuleAnswers
         $applications = $this->applicationsOf($name);
 
         if ($applications->isEmpty()) {
-            return $this->answer("Decision – {$name}", [
+            return $this->answer('Decision', [
                 $this->row("No application found for {$name}.", 'medium'),
             ]);
         }
@@ -701,15 +1294,12 @@ class RuleAnswers
         foreach ($applications as $application) {
             $status = self::STATUS_LABELS[$application->status] ?? $application->status;
 
-            $label = $application->job_title . ($application->submitted_at
-                ? ' (submitted ' . $application->submitted_at->format('M j, Y g:i A') . ')'
-                : '');
+            $head = $application->job_title . ' (submitted '
+                . ($application->submitted_at ? $application->submitted_at->format('M j, Y g:i A') : 'date unknown') . ')';
 
-            if ($application->reviewed_at && in_array($application->status, ['approved', 'rejected'], true)) {
-                $text = "{$label}: {$status} on " . $application->reviewed_at->format('M j, Y g:i A') . '.';
-            } else {
-                $text = "{$label}: no decision yet, current status {$status}.";
-            }
+            $text = ($application->reviewed_at && in_array($application->status, ['approved', 'rejected'], true))
+                ? "{$name}: {$status} on " . $application->reviewed_at->format('M j, Y g:i A') . " for {$head}."
+                : "{$name}: no decision yet for {$head}, current status {$status}.";
 
             if ($application->remarks) {
                 $text .= ' HR remarks: ' . Str::limit($application->remarks, 120);
@@ -718,12 +1308,11 @@ class RuleAnswers
             $items[] = $this->row(
                 $text,
                 $application->status === 'rejected' ? 'high' : 'medium',
-                $application->status === 'draft' ? null : route('hr.applicants.show', $application),
-                'Decision'
+                $this->applicationUrl($application)
             );
         }
 
-        return $this->answer("Decision – {$name}", $items);
+        return $this->answer('Decision', $items);
     }
 
     // "When is Kym's interview?"
@@ -732,7 +1321,7 @@ class RuleAnswers
         $applications = $this->applicationsOf($name);
 
         if ($applications->isEmpty()) {
-            return $this->answer("Interview – {$name}", [
+            return $this->answer('Interview', [
                 $this->row("No application found for {$name}.", 'medium'),
             ]);
         }
@@ -743,33 +1332,37 @@ class RuleAnswers
             $status = self::STATUS_LABELS[$application->status] ?? $application->status;
 
             if ($application->interview_at) {
-                $text = "{$application->job_title}: interview on "
+                $text = "{$name}: interview on "
                     . Carbon::parse($application->interview_at)->format('l, M j, Y \a\t g:i A')
-                    . ($application->interview_location ? ", {$application->interview_location}" : '') . '.';
+                    . ($application->interview_location ? ", {$application->interview_location}" : '')
+                    . " for {$application->job_title}.";
 
                 if ($application->interview_completed_at) {
                     $text .= ' Completed ' . Carbon::parse($application->interview_completed_at)->format('M j, Y g:i A') . '.';
                 }
             } else {
-                $text = "{$application->job_title}: no interview scheduled yet, current status {$status}.";
+                $text = "{$name}: no interview scheduled yet for {$application->job_title}, current status {$status}.";
             }
 
-            $items[] = $this->row(
-                $text,
-                'medium',
-                $application->status === 'draft' ? null : route('hr.applicants.show', $application),
-                'Interview'
-            );
+            $items[] = $this->row($text, 'medium', $this->applicationUrl($application));
         }
 
-        return $this->answer("Interview – {$name}", $items);
+        return $this->answer('Interview', $items);
     }
 
     // Everything the system knows about one person, or just the part that was asked.
-    private function personProfile(string $name, ?string $focus = null): array
+    private function personProfile(string $name, ?string $focus = null, ?string $lead = null): array
     {
+        if ($focus === 'completeness') {
+            return $this->personCompleteness($name);
+        }
+
         if ($focus === 'role') {
             return $this->personRole($name);
+        }
+
+        if ($focus === 'employment') {
+            return $this->employmentAnswer($name, false);
         }
 
         if ($focus === 'decision') {
@@ -780,92 +1373,81 @@ class RuleAnswers
             return $this->personInterview($name);
         }
 
-        $items = [];
+        $employee = Employee::with('user')->where('name', $name)->first();
+        $applications = $this->applicationsOf($name);
+        $logs = AttendanceLog::where('employee_name', $name)->orderBy('time_in')->get();
+        $documents = EmployeeDocument::where('employee_name', $name)->orderBy('expiry_date')->get();
 
-        foreach ($this->applicationsOf($name) as $application) {
-            $status = self::STATUS_LABELS[$application->status] ?? $application->status;
-            $parts = ["{$application->job_title}, status {$status}"];
+        $bits = [];
 
-            if ($application->status === 'draft') {
-                $parts[] = 'form step ' . (int) $application->step . ' of 3';
-            }
+        if ($employee) {
+            $bits[] = "{$employee->position}, {$employee->employment_status}";
+        }
 
-            if ($application->submitted_at) {
-                $parts[] = 'submitted ' . $application->submitted_at->format('M j, Y g:i A');
-            }
+        if ($applications->isNotEmpty()) {
+            $latest = $applications->first();
 
-            if ($application->interview_at) {
-                $parts[] = 'interview ' . Carbon::parse($application->interview_at)->format('M j, Y g:i A')
-                    . ($application->interview_location ? ' at ' . $application->interview_location : '');
-            }
+            $bits[] = 'applicant (' . Str::lower(self::STATUS_LABELS[$latest->status] ?? $latest->status) . ')';
+        }
 
-            if ($application->reviewed_at) {
-                $parts[] = 'decided ' . $application->reviewed_at->format('M j, Y g:i A');
-            }
+        $lead ??= $bits ? "{$name}: " . implode('; ', $bits) . '.' : "No records found for {$name}.";
 
-            if ($application->remarks) {
-                $parts[] = 'HR remarks: ' . Str::limit($application->remarks, 80);
-            }
+        $items = [$this->row($lead, 'medium')];
 
+        if ($employee) {
             $items[] = $this->row(
-                implode('; ', $parts) . '.',
-                'low',
-                $application->status === 'draft' ? null : route('hr.applicants.show', $application),
-                'Application'
+                'Date hired: ' . ($employee->date_hired ? $employee->date_hired->format('M j, Y') : 'not recorded')
+                    . ($employee->user ? '; system account role: ' . $employee->user->roleLabel() : '') . '.'
             );
         }
 
-        $logs = AttendanceLog::where('employee_name', $name)->orderBy('time_in')->get();
+        foreach ($applications as $application) {
+            $items[] = $this->row($this->applicationSummary($application), 'low', $this->applicationUrl($application));
+        }
 
         if ($logs->isNotEmpty()) {
-            $week = $this->minutes($this->logs($name, today()->startOfWeek(), today()->endOfWeek()));
-            $month = $this->minutes($this->logs($name, today()->startOfMonth(), today()->endOfMonth()));
+            $items[] = $this->row(
+                'Worked: this week ' . $this->fmt($this->minutes($this->logs($name, today()->startOfWeek(), today()->endOfWeek())))
+                    . '; this month ' . $this->fmt($this->minutes($this->logs($name, today()->startOfMonth(), today()->endOfMonth())))
+                    . '; in total ' . $this->fmt($this->minutes($logs)) . '.'
+            );
 
-            $open = $logs
-                ->filter(fn ($log) => $log->time_out === null && $log->time_in >= now()->subHours(24))
-                ->last();
+            $items = array_merge($items, $this->dutyNotes($logs));
+        }
+
+        $required = $this->requiredDocuments();
+
+        if ($required && ($documents->isNotEmpty() || $employee)) {
+            $missing = $this->missingFrom($documents->pluck('document_type'), $required);
 
             $items[] = $this->row(
-                'Worked hours: this week ' . $this->fmt($week)
-                    . '; this month ' . $this->fmt($month)
-                    . '; all time ' . $this->fmt($this->minutes($logs))
-                    . ($open ? '; on duty now since ' . $open->time_in->format('g:i A') : '; not on duty now') . '.',
-                $open ? 'medium' : 'low',
-                null,
-                'Attendance'
+                'Documents: ' . (count($required) - count($missing)) . ' of ' . count($required) . ' required on file'
+                    . ($missing ? '; missing ' . implode(', ', $missing) : '') . '.',
+                $missing ? 'high' : 'low'
             );
         }
 
-        $documents = EmployeeDocument::where('employee_name', $name)->orderBy('expiry_date')->get();
+        $urgent = (int) config('hris.urgent_days', 7);
+        $warning = (int) config('hris.warning_days', 30);
 
         foreach ($documents as $document) {
             $days = (int) today()->diffInDays($document->expiry_date, true);
 
             if ($document->expiry_date->lt(today())) {
-                $state = "expired {$days} day(s) ago";
-                $level = 'critical';
-            } elseif ($document->expiry_date->lte(today()->addDays(30))) {
-                $state = "{$days} day(s) left";
-                $level = 'high';
-            } else {
-                $state = 'valid';
-                $level = 'low';
+                $items[] = $this->row("Expired: {$document->document_type}, {$days} day(s) ago", 'critical');
+            } elseif ($document->expiry_date->lte(today()->addDays($warning))) {
+                $items[] = $this->row("Expiring: {$document->document_type}, {$days} day(s) left", $days <= $urgent ? 'high' : 'medium');
             }
-
-            $items[] = $this->row(
-                "{$document->document_type}, expires " . $document->expiry_date->format('M j, Y') . " ({$state}).",
-                $level,
-                null,
-                'Document'
-            );
         }
 
-        if (!$items) {
-            $items[] = $this->row("No records found for {$name}.", 'medium');
-        }
-
-        return $this->answer($name, $items);
+        return $this->answer('Profile', $items);
     }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Applicants (HR view)
+    |--------------------------------------------------------------------------
+    */
 
     private function hrApplicants(string $q): array
     {
@@ -886,12 +1468,12 @@ class RuleAnswers
         $statuses = null;
         $what = 'submitted';
 
-        if ($this->has($q, ['approved', 'approve'])) {
-            $statuses = ['approved'];
-            $what = 'approved';
-        } elseif ($this->has($q, ['rejected', 'reject', 'denied'])) {
+        if ($this->has($q, self::REJECTED_WORDS)) {
             $statuses = ['rejected'];
             $what = 'rejected';
+        } elseif ($this->has($q, self::APPROVED_WORDS)) {
+            $statuses = ['approved'];
+            $what = 'approved';
         } elseif ($this->has($q, ['interview'])) {
             $statuses = ['interview_scheduled', 'interview_completed'];
             $what = 'in the interview stage';
@@ -913,7 +1495,7 @@ class RuleAnswers
             ->get();
 
         $count = $applications->count();
-        $when = $from ? Str::lower($label) : 'in total';
+        $when = $this->when($label, $from);
 
         if ($interviewStage && $from) {
             $when .= ' (by interview date)';
@@ -923,7 +1505,7 @@ class RuleAnswers
 
         $items = [
             $this->row(
-                "{$count} application(s) {$what} – {$when}",
+                "{$count} application(s) {$what} {$when}.",
                 $count === 0 ? 'low' : ($isPending ? 'high' : 'medium'),
                 $count > 0 ? route('hr.applicants') : null
             ),
@@ -933,32 +1515,32 @@ class RuleAnswers
         if ($statuses === null && $count > 0) {
             $parts = $applications
                 ->groupBy('status')
-                ->map(fn (Collection $group, string $status) => (self::STATUS_LABELS[$status] ?? $status) . ': ' . $group->count())
+                ->map(fn (Collection $group, string $status) => (self::STATUS_LABELS[$status] ?? $status) . ' ' . $group->count())
                 ->values()
-                ->implode(' · ');
+                ->implode(', ');
 
-            $items[] = $this->row($parts, 'low', null, 'By status');
+            $items[] = $this->row("By status: {$parts}.");
         }
 
         foreach ($applications->take(5) as $application) {
             $name = $application->applicant->name ?? 'Unknown';
             $status = self::STATUS_LABELS[$application->status] ?? $application->status;
 
-            $line = "{$name}, {$application->job_title} ({$status})";
+            $line = "{$name}: {$application->job_title}, {$status}";
 
             if ($interviewStage && $application->interview_at) {
                 $line .= ', interview ' . Carbon::parse($application->interview_at)->format('M j, g:i A')
                     . ($application->interview_location ? ' at ' . $application->interview_location : '');
             }
 
-            $items[] = $this->row($line, 'low', route('hr.applicants.show', $application), 'Applicant');
+            $items[] = $this->row($line, 'low', route('hr.applicants.show', $application));
         }
 
         if ($count > 5) {
-            $items[] = $this->row('+' . ($count - 5) . ' more', 'low');
+            $items[] = $this->row('+' . ($count - 5) . ' more');
         }
 
-        return $this->answer("Applicants – {$label}", $items);
+        return $this->answer('Applicants', $items);
     }
 
     // "What needs my attention?": everything HR still has to act on.
@@ -975,9 +1557,15 @@ class RuleAnswers
         $scheduled = (int) ($counts['interview_scheduled'] ?? 0);
         $interviewed = (int) ($counts['interview_completed'] ?? 0);
 
+        $warning = (int) config('hris.warning_days', 30);
+
         $expired = EmployeeDocument::whereDate('expiry_date', '<', today())->count();
 
-        $soon = EmployeeDocument::whereBetween('expiry_date', [today(), today()->addDays(30)])->count();
+        $soon = EmployeeDocument::whereDate('expiry_date', '>=', today())
+            ->whereDate('expiry_date', '<=', today()->addDays($warning))
+            ->count();
+
+        $incomplete = $this->incompleteList()->count();
 
         $onDuty = AttendanceLog::whereNull('time_out')
             ->where('time_in', '>=', now()->subHours(24))
@@ -1006,22 +1594,28 @@ class RuleAnswers
         }
 
         if ($soon > 0) {
-            $items[] = $this->row("{$soon} document(s) expiring within 30 days", 'high', route('hr.compliance'));
+            $items[] = $this->row("{$soon} document(s) expiring within {$warning} days", 'high', route('hr.compliance'));
         }
 
-        if (!$items) {
-            $items[] = $this->row('Nothing needs your attention right now.', 'low');
+        if ($incomplete > 0) {
+            $items[] = $this->row("{$incomplete} employee(s) are missing required documents", 'medium', route('hr.compliance'));
         }
 
-        $items[] = $this->row("{$onDuty} employee(s) on duty now.", 'low');
+        $lead = $items
+            ? $this->row(count($items) . ' item(s) need your attention.', 'high')
+            : $this->row('Nothing needs your attention right now.', 'low');
 
-        return $this->answer('What needs your attention', $items);
+        array_unshift($items, $lead);
+
+        $items[] = $this->row("{$onDuty} employee(s) on duty now.");
+
+        return $this->answer('Overview', $items);
     }
 
     private function identity(string $role, ?string $name): array
     {
         if ($role === 'Applicant' && !$name) {
-            return $this->answer('Who you are', [
+            return $this->answer('', [
                 $this->row('Log in and I can tell you which account you are using.', 'medium'),
             ]);
         }
@@ -1029,19 +1623,19 @@ class RuleAnswers
         if ($name) {
             $kind = $role === 'Employee' ? 'an employee' : 'a job applicant';
 
-            return $this->answer('Who you are', [
-                $this->row("You are {$name}, {$kind} at Frontier Security Services Inc.", 'low'),
+            return $this->answer('', [
+                $this->row("You are {$name}, {$kind} at Frontier Security Services Inc."),
             ]);
         }
 
-        return $this->answer('Who you are', [
-            $this->row('You are using the HR portal. I do not know your name because HR has no login in this demo yet.', 'low'),
+        return $this->answer('', [
+            $this->row('You are using the HR portal. I do not know your name because HR has no login in this demo yet.'),
         ]);
     }
 
     /*
     |--------------------------------------------------------------------------
-    | Employee
+    | Employee (Security Personnel): own records only
     |--------------------------------------------------------------------------
     */
 
@@ -1050,57 +1644,37 @@ class RuleAnswers
         if ($this->has($q, self::HOURS_WORDS)) {
             [$label, $from, $to] = $this->range($q);
 
-            return $this->hoursFor($name, $label, $from, $to, 'My worked hours');
+            return $this->hoursFor($name, $label, $from, $to, true);
         }
 
         if ($this->has($q, self::ATTENDANCE_WORDS)) {
             [$label, $from, $to] = $this->range($q);
 
-            return $this->attendanceFor($name, $label, $from, $to, 'My attendance');
+            return $this->attendanceFor($name, $label, $from, $to, true);
         }
 
         if ($this->hasWord($q, self::SCHEDULE_WORDS) || $this->has($q, self::SCHEDULE_PHRASES)) {
-            $result = $this->attendanceFor($name, 'All time', null, null, 'My attendance');
+            $records = $this->attendanceFor($name, 'All time', null, null, true);
 
-            array_unshift($result['items'], $this->scheduleNote());
+            return $this->answer('Attendance', array_merge($this->scheduleNotes(), $records['items']));
+        }
 
-            return $result;
+        if ($this->asksCompleteness($q) && $this->has($q, self::DOCUMENT_WORDS)) {
+            return $this->personCompleteness($name, true);
         }
 
         if ($this->has($q, self::DOCUMENT_WORDS)) {
-            return $this->employeeDocuments($name);
+            return $this->employeeDocuments($name, true);
+        }
+
+        if (
+            $this->hasWord($q, ['role', 'position'])
+            || $this->has($q, ['posisyon', 'employment status', 'date hired', 'hired', 'na hire', 'nahire'])
+        ) {
+            return $this->employmentAnswer($name, true);
         }
 
         return $this->isGreeting($q) ? $this->help('Employee', 'How can I help?') : null;
-    }
-
-    private function employeeDocuments(string $name, string $title = 'My documents'): array
-    {
-        $documents = EmployeeDocument::where('employee_name', $name)
-            ->orderBy('expiry_date')
-            ->get();
-
-        if ($documents->isEmpty()) {
-            return $this->answer($title, [
-                $this->row('No documents are on file yet.', 'medium'),
-            ]);
-        }
-
-        $items = [];
-
-        foreach ($documents as $document) {
-            $days = (int) today()->diffInDays($document->expiry_date, true);
-
-            if ($document->expiry_date->lt(today())) {
-                $items[] = $this->row("{$document->document_type}, expired {$days} day(s) ago", 'critical', null, 'Expired');
-            } elseif ($document->expiry_date->lte(today()->addDays(30))) {
-                $items[] = $this->row("{$document->document_type}, {$days} day(s) left", 'high', null, 'Expiring');
-            } else {
-                $items[] = $this->row("{$document->document_type}, valid until " . $document->expiry_date->format('M j, Y'), 'low', null, 'Valid');
-            }
-        }
-
-        return $this->answer($title, $items);
     }
 
     /*
@@ -1125,7 +1699,7 @@ class RuleAnswers
         $applicant = Auth::guard('applicant')->user();
 
         if (!$applicant) {
-            return $this->answer('Please log in', [
+            return $this->answer('', [
                 $this->row('Log in to ask about your application.', 'medium'),
             ]);
         }
@@ -1133,9 +1707,9 @@ class RuleAnswers
         $application = $applicant->applications()->latest('id')->first();
 
         if (!$application) {
-            return $this->answer('No application yet', [
+            return $this->answer('Application', [
                 $this->row('You have not started an application yet.', 'medium'),
-                $this->row('Click "Start Application" on your dashboard to begin.', 'medium'),
+                $this->row('Click "Start Application" on your dashboard to begin.'),
             ]);
         }
 
@@ -1145,42 +1719,38 @@ class RuleAnswers
             if ($application->interview_at) {
                 $when = Carbon::parse($application->interview_at);
 
-                $items = [
-                    $this->row('Your interview: ' . $when->format('l, M j, Y \a\t g:i A'), 'high'),
-                ];
+                $items = [$this->row('Your interview: ' . $when->format('l, M j, Y \a\t g:i A') . '.', 'high')];
 
                 if ($application->interview_location) {
                     $items[] = $this->row("Location: {$application->interview_location}", 'medium');
                 }
 
-                return $this->answer('Your interview', $items);
+                return $this->answer('Interview', $items);
             }
 
-            return $this->answer('Your interview', [
+            return $this->answer('Interview', [
                 $this->row('No interview is scheduled yet.', 'medium'),
-                $this->row($this->nextStep($application), 'low', null, 'Next step'),
+                $this->row($this->nextStep($application)),
             ]);
         }
 
         if ($intent === 'next') {
-            return $this->answer('Your next step', [
+            return $this->answer('Next step', [
                 $this->row($this->nextStep($application), 'high'),
             ]);
         }
 
         $level = in_array($application->status, ['approved', 'rejected'], true) ? 'high' : 'medium';
 
-        $items = [
-            $this->row("{$application->job_title}: {$label}", $level, null, 'Status'),
-        ];
+        $items = [$this->row("Your application for {$application->job_title}: {$label}.", $level)];
 
         if ($application->remarks) {
-            $items[] = $this->row($application->remarks, 'medium', null, 'HR remarks');
+            $items[] = $this->row("HR remarks: {$application->remarks}", 'medium');
         }
 
-        $items[] = $this->row($this->nextStep($application), 'low', null, 'Next step');
+        $items[] = $this->row('Next: ' . $this->nextStep($application));
 
-        return $this->answer('Your application', $items);
+        return $this->answer('Application', $items);
     }
 
     private function nextStep(Application $application): string
@@ -1204,49 +1774,9 @@ class RuleAnswers
 
     /*
     |--------------------------------------------------------------------------
-    | Worked hours
+    | Data helpers
     |--------------------------------------------------------------------------
     */
-
-    private function hoursFor(
-        string $name,
-        string $label,
-        ?Carbon $from,
-        ?Carbon $to,
-        ?string $title = null
-    ): array {
-        $title ??= "{$name} – worked hours";
-
-        $logs = $this->logs($name, $from, $to);
-        $closed = $logs->filter(fn ($log) => $log->time_out !== null);
-
-        $items = [];
-
-        if ($logs->isEmpty()) {
-            $items[] = $this->row('No attendance records for ' . Str::lower($label) . '.', 'medium');
-        } else {
-            $when = $from ? $label : 'Total (all time)';
-
-            $items[] = $this->row(
-                "{$when}: " . $this->fmt($this->minutes($closed)) . " in {$closed->count()} shift(s)",
-                'high'
-            );
-        }
-
-        if ($from === null) {
-            $month = $this->minutes($this->logs($name, today()->startOfMonth(), today()->endOfMonth()));
-            $week = $this->minutes($this->logs($name, today()->startOfWeek(), today()->endOfWeek()));
-
-            $items[] = $this->row('This month: ' . $this->fmt($month), 'low');
-            $items[] = $this->row('This week: ' . $this->fmt($week), 'low');
-        } else {
-            $all = $this->minutes($this->logs($name, null, null));
-
-            $items[] = $this->row('Total (all time): ' . $this->fmt($all), 'low');
-        }
-
-        return $this->answer($title, array_merge($items, $this->dutyNotes($logs)));
-    }
 
     private function logs(?string $name, ?Carbon $from, ?Carbon $to): Collection
     {
@@ -1275,6 +1805,12 @@ class RuleAnswers
         $rest = $minutes % 60;
 
         return $rest > 0 ? "{$hours} h {$rest} min" : "{$hours} h";
+    }
+
+    // "today", "last month"... or "in total" when no period was asked.
+    private function when(string $label, ?Carbon $from): string
+    {
+        return $from ? Str::lower($label) : 'in total';
     }
 
     /*
@@ -1415,8 +1951,13 @@ class RuleAnswers
 
     /*
     |--------------------------------------------------------------------------
-    | Answer shape: a title and rows. "tag" is a small label above a row.
+    | Answer shape
     |--------------------------------------------------------------------------
+    |
+    | title: a small label above the answer (can be empty).
+    | lead:  true means the first row is the direct answer, shown as a sentence.
+    | items: the rows. The first one is the lead, the others are bullets.
+    |
     */
 
     private function row(string $text, string $level = 'low', ?string $url = null, ?string $tag = null): array
@@ -1428,6 +1969,7 @@ class RuleAnswers
     {
         return [
             'title' => $title,
+            'lead' => $items !== [],
             'items' => array_values($items),
         ];
     }
