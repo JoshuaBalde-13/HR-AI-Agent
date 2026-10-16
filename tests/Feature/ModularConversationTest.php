@@ -135,4 +135,89 @@ class ModularConversationTest extends TestCase
         $this->assertNull($memory->lastQuestion($hrSessionB));
         $this->assertNull($memory->lastQuestion($employeeSessionA));
     }
+
+    public function test_switching_named_employee_updates_context_for_pronoun_follow_up(): void
+    {
+        $joshua = Employee::create([
+            'name' => 'Joshua Balde',
+            'position' => 'Security Guard',
+            'employment_status' => 'Active',
+            'date_hired' => '2020-03-15',
+        ]);
+
+        Employee::create([
+            'name' => 'Kym Mendroga',
+            'position' => 'Team Leader',
+            'employment_status' => 'Active',
+            'date_hired' => '2021-05-10',
+        ]);
+
+        EmployeeDocument::create([
+            'employee_id' => $joshua->id,
+            'employee_name' => 'Joshua Balde',
+            'document_type' => 'Government ID',
+            'expiry_date' => today()->addDays(90),
+        ]);
+
+        $assistant = app(HRISAssistantService::class);
+        $context = $this->hrContext('switch-person-' . uniqid());
+
+        $assistant->ask($context, "What is Joshua's position?");
+        $assistant->ask($context, "What is Kym's position?");
+
+        $answer = $assistant->ask($context, 'Kumpleto ba documents niya?');
+
+        $text = mb_strtolower(
+            json_encode($answer, JSON_UNESCAPED_UNICODE)
+        );
+
+        $this->assertStringContainsString('kym mendroga', $text);
+        $this->assertStringNotContainsString('joshua balde', $text);
+    }
+
+    public function test_unknown_employee_question_does_not_reuse_previous_person(): void
+    {
+        config(['ollama.enabled' => false]);
+
+        $joshua = Employee::create([
+            'name' => 'Joshua Balde',
+            'position' => 'Security Guard',
+            'employment_status' => 'Active',
+            'date_hired' => '2020-03-15',
+        ]);
+
+        EmployeeDocument::create([
+            'employee_id' => $joshua->id,
+            'employee_name' => 'Joshua Balde',
+            'document_type' => 'Government ID',
+            'expiry_date' => today()->addDays(90),
+        ]);
+
+        $assistant = app(HRISAssistantService::class);
+        $context = $this->hrContext('unknown-person-' . uniqid());
+
+        $assistant->ask($context, "What is Joshua's position?");
+
+        $unknownAnswer = $assistant->ask(
+            $context,
+            "What is Alex's position?"
+        );
+
+        $unknownText = mb_strtolower(
+            json_encode($unknownAnswer, JSON_UNESCAPED_UNICODE)
+        );
+
+        $this->assertStringNotContainsString('joshua balde', $unknownText);
+
+        $followUp = $assistant->ask(
+            $context,
+            'Kumpleto ba documents niya?'
+        );
+
+        $followUpText = mb_strtolower(
+            json_encode($followUp, JSON_UNESCAPED_UNICODE)
+        );
+
+        $this->assertStringNotContainsString('joshua balde', $followUpText);
+    }
 }

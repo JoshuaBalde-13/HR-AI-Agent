@@ -65,7 +65,11 @@ class HRISAssistantService
         }
 
         // Internal fields never go to the browser.
-        unset($response['person'], $response['asked']);
+        unset(
+            $response['person'],
+            $response['asked'],
+            $response['clear_person']
+        );
 
         $response['v'] = RuleAnswers::VERSION;
 
@@ -157,11 +161,19 @@ class HRISAssistantService
     // Only answers that are about a topic are remembered ("thank you" is not).
     private function remember(AssistantContext $ctx, array $answer, string $question): void
     {
+        if (($answer['clear_person'] ?? false) === true) {
+            $this->memory->forgetPerson($ctx);
+        }
+
         if (($answer['title'] ?? '') === '') {
             return;
         }
 
-        $this->memory->remember($ctx, $answer['asked'] ?? $question, $answer['person'] ?? null);
+        $this->memory->remember(
+            $ctx,
+            $answer['asked'] ?? $question,
+            $answer['person'] ?? null
+        );
     }
 
     private function shortFollowUp(string $question): bool
