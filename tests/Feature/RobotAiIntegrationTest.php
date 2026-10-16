@@ -594,4 +594,109 @@ public function test_robot_endpoint_switches_employee_context_when_another_emplo
         $attendanceText
     );
 }
+
+public function test_robot_endpoint_does_not_reuse_selected_employee_after_unknown_name(): void
+{
+    $this->withCredentials();
+
+    config(['ollama.enabled' => false]);
+
+    Employee::create([
+        'name' => 'Joshua Santos',
+        'position' => 'Security Officer',
+        'employment_status' => 'Active',
+    ]);
+
+    $santosClockIn = now()->subDay()->setTime(10, 0);
+
+    AttendanceLog::create([
+        'employee_name' => 'Joshua Santos',
+        'time_in' => $santosClockIn,
+        'time_out' => $santosClockIn->copy()->addHours(8),
+    ]);
+
+    $this->actingAs($this->hr, 'web');
+
+    $sessionCookieName = config('session.cookie');
+
+    // 1. Select Joshua Santos.
+    $selection = $this->postJson(route('robot.ask'), [
+        'question' => 'Joshua Santos',
+        'role' => 'HR',
+        'employee_name' => null,
+    ]);
+
+    $selection->assertOk();
+
+    $sessionCookie = $selection
+        ->getCookie($sessionCookieName)?->getValue();
+
+    $this->assertNotNull($sessionCookie);
+
+    $this->withCookie($sessionCookieName, $sessionCookie);
+
+    $selectionText = mb_strtolower(
+        json_encode($selection->json(), JSON_UNESCAPED_UNICODE)
+    );
+
+    $this->assertStringContainsString('joshua santos', $selectionText);
+    $this->assertStringContainsString('security officer', $selectionText);
+
+    // 2. Ask about an unknown employee.
+    $unknown = $this->postJson(route('robot.ask'), [
+        'question' => "What is Alex's position?",
+        'role' => 'HR',
+        'employee_name' => null,
+    ]);
+
+    $unknown->assertOk();
+
+    $unknownCookie = $unknown
+        ->getCookie($sessionCookieName)?->getValue();
+
+    $this->assertNotNull($unknownCookie);
+
+    $this->assertSame(
+        $sessionCookie,
+        $unknownCookie,
+        'The session should remain stable after an unknown-name question.'
+    );
+
+    $this->withCookie($sessionCookieName, $unknownCookie);
+
+    $unknownText = mb_strtolower(
+        json_encode($unknown->json(), JSON_UNESCAPED_UNICODE)
+    );
+
+    $this->assertStringNotContainsString('joshua santos', $unknownText);
+
+    // 3. Follow up with a pronoun. It must not reuse Joshua Santos.
+    $attendance = $this->postJson(route('robot.ask'), [
+        'question' => 'When did he last clock in?',
+        'role' => 'HR',
+        'employee_name' => null,
+    ]);
+
+    $attendance->assertOk();
+
+    $attendanceText = mb_strtolower(
+        json_encode($attendance->json(), JSON_UNESCAPED_UNICODE)
+    );
+
+    $this->assertStringContainsString(
+        'please include the employee name',
+        $attendanceText
+    );
+
+    $this->assertStringNotContainsString(
+        'joshua santos',
+        $attendanceText
+    );
+
+    $this->assertStringNotContainsString(
+        mb_strtolower($santosClockIn->format('M j, Y g:i A')),
+        $attendanceText
+    );
+}
+
 }
