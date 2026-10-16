@@ -220,4 +220,56 @@ class ModularConversationTest extends TestCase
 
         $this->assertStringNotContainsString('joshua balde', $followUpText);
     }
+
+
+    public function test_ambiguous_employee_clarification_preserves_original_question(): void
+    {
+        config(['ollama.enabled' => false]);
+
+        Employee::create([
+            'name' => 'Joshua Balde',
+            'position' => 'Security Guard',
+            'employment_status' => 'Active',
+        ]);
+
+        Employee::create([
+            'name' => 'Joshua Santos',
+            'position' => 'Operations Supervisor',
+            'employment_status' => 'Active',
+        ]);
+
+        $assistant = app(HRISAssistantService::class);
+        $context = $this->hrContext('clarification-follow-up-' . uniqid());
+
+        $clarification = $assistant->ask(
+            $context,
+            'What position does Joshua have?'
+        );
+
+        $clarificationText = mb_strtolower(
+            json_encode($clarification, JSON_UNESCAPED_UNICODE)
+        );
+
+        $this->assertStringContainsString('joshua balde', $clarificationText);
+        $this->assertStringContainsString('joshua santos', $clarificationText);
+
+        $this->assertTrue(
+            str_contains($clarificationText, 'which employee')
+                || str_contains($clarificationText, 'more than one match')
+                || str_contains($clarificationText, 'full name')
+                || str_contains($clarificationText, 'which one'),
+            "Expected a clarification question. Answer: {$clarificationText}"
+        );
+
+        $answer = $assistant->ask($context, 'Joshua Santos');
+
+        $answerText = mb_strtolower(
+            json_encode($answer, JSON_UNESCAPED_UNICODE)
+        );
+
+        $this->assertStringContainsString('joshua santos', $answerText);
+        $this->assertStringContainsString('operations supervisor', $answerText);
+        $this->assertStringNotContainsString('joshua balde', $answerText);
+    }
+
 }
