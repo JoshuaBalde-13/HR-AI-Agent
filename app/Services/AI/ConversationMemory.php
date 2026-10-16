@@ -23,6 +23,11 @@ class ConversationMemory
         return Cache::get($this->key($ctx, 'person'));
     }
 
+    public function forgetPerson(AssistantContext $ctx): void
+    {
+        Cache::forget($this->key($ctx, 'person'));
+    }
+
     public function remember(AssistantContext $ctx, string $question, ?string $person = null): void
     {
         Cache::put($this->key($ctx, 'question'), Str::limit($question, 200, ''), now()->addHour());

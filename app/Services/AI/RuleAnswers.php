@@ -160,11 +160,56 @@ class RuleAnswers
             ? $this->withPerson($q, $user['person'] ?? null)
             : $q;
 
+        // Without a remembered person, don't turn a pronoun follow-up
+        // into a company-wide query.
+        if (
+            $isHr
+            && empty($user['person'])
+            && $this->hasWord($q, self::PRONOUNS)
+        ) {
+            $people = $this->employeeNames()
+                ->merge(Applicant::query()->pluck('name'))
+                ->filter()
+                ->unique()
+                ->values();
+
+            if ($this->findEmployees($q, $people)->isEmpty()) {
+                $answer = $this->answer('Which employee?', [
+                    $this->row(
+                        'Who are you asking about? Please include the employee’s full name so I can check the correct records.',
+                        'medium'
+                    ),
+                ]);
+
+                $answer['asked'] = $q;
+                $answer['clear_person'] = true;
+
+                return $answer;
+            }
+        }
+
         $answer = match ($role) {
             'HR', 'HR Personnel' => $this->askHr($questionForRules),
             'Employee' => $this->askEmployee($q, $user['name'] ?? ''),
             default => $this->askApplicant($q),
         };
+
+        // An unresolved person-specific query must not preserve a stale person.
+        if (
+            $answer === null
+            && $isHr
+            && $this->isPersonSpecificQuestion($questionForRules)
+        ) {
+            $answer = $this->answer('People', [
+                $this->row(
+                    'I could not match the name in that question to an employee or applicant record. Please check the name and try again.',
+                    'medium'
+                ),
+            ]);
+
+            $answer['asked'] = $q;
+            $answer['clear_person'] = true;
+        }
 
         if ($answer !== null) {
             $answer['asked'] = $q;
@@ -174,6 +219,8 @@ class RuleAnswers
 
                 if ($person !== null) {
                     $answer['person'] = $person;
+                } elseif ($this->isPersonSpecificQuestion($questionForRules)) {
+                    $answer['clear_person'] = true;
                 }
             }
         }
@@ -246,6 +293,26 @@ class RuleAnswers
         return $matches->count() === 1
             ? $matches->first()
             : null;
+    }
+
+    /**
+     * A specific person lookup that does not resolve must not leave the
+     * previous employee available for a later pronoun follow-up.
+     */
+    private function isPersonSpecificQuestion(string $q): bool
+    {
+        if ($this->personFocus($q) !== null) {
+            return true;
+        }
+
+        if ($this->mentionedName($q) === null) {
+            return false;
+        }
+
+        return $this->has($q, self::DOCUMENT_WORDS)
+            || $this->has($q, self::HOURS_WORDS)
+            || $this->has($q, self::ATTENDANCE_WORDS)
+            || $this->has($q, self::EMPLOYEE_WORDS);
     }
 
     // $lead is the first line: what went wrong, or what to try.
