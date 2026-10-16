@@ -272,4 +272,63 @@ class ModularConversationTest extends TestCase
         $this->assertStringNotContainsString('joshua balde', $answerText);
     }
 
+
+    public function test_clarified_employee_is_remembered_for_document_follow_up(): void
+    {
+        config(['ollama.enabled' => false]);
+
+        $joshuaBalde = Employee::create([
+            'name' => 'Joshua Balde',
+            'position' => 'Security Guard',
+            'employment_status' => 'Active',
+            'date_hired' => '2020-03-15',
+        ]);
+
+        Employee::create([
+            'name' => 'Joshua Santos',
+            'position' => 'Operations Supervisor',
+            'employment_status' => 'Active',
+            'date_hired' => '2021-04-10',
+        ]);
+
+        EmployeeDocument::create([
+            'employee_id' => $joshuaBalde->id,
+            'employee_name' => 'Joshua Balde',
+            'document_type' => 'Government ID',
+            'expiry_date' => today()->addDays(90),
+        ]);
+
+        $assistant = app(HRISAssistantService::class);
+        $context = $this->hrContext('clarified-document-follow-up-' . uniqid());
+
+        $clarification = $assistant->ask(
+            $context,
+            'What position does Joshua have?'
+        );
+
+        $clarificationText = mb_strtolower(
+            json_encode($clarification, JSON_UNESCAPED_UNICODE)
+        );
+
+        $this->assertStringContainsString('joshua balde', $clarificationText);
+        $this->assertStringContainsString('joshua santos', $clarificationText);
+
+        $assistant->ask($context, 'Joshua Santos');
+
+        $memory = app(ConversationMemory::class);
+        $this->assertSame('Joshua Santos', $memory->lastPerson($context));
+
+        $answer = $assistant->ask(
+            $context,
+            'Kumpleto ba documents niya?'
+        );
+
+        $answerText = mb_strtolower(
+            json_encode($answer, JSON_UNESCAPED_UNICODE)
+        );
+
+        $this->assertStringContainsString('joshua santos', $answerText);
+        $this->assertStringContainsString('0 of 4 required documents', $answerText);
+        $this->assertStringNotContainsString('joshua balde', $answerText);
+    }
 }
