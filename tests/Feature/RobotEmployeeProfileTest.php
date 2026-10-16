@@ -112,4 +112,29 @@ class RobotEmployeeProfileTest extends TestCase
         $this->assertStringContainsString('(valid)', $answer);
     }
 
+
+    public function test_hr_is_asked_to_clarify_ambiguous_employee_profile_name(): void
+    {
+        $this->createJoshua();
+
+        Employee::create([
+            'name' => 'Joshua Santos',
+            'position' => 'Operations Supervisor',
+            'employment_status' => 'Active',
+            'date_hired' => '2021-04-10',
+        ]);
+
+        $answer = $this->askAsHr('What position does Joshua have?');
+
+        $this->assertStringContainsString('joshua balde', $answer);
+        $this->assertStringContainsString('joshua santos', $answer);
+
+        $this->assertTrue(
+            str_contains($answer, 'which employee')
+                || str_contains($answer, 'more than one match')
+                || str_contains($answer, 'full name')
+                || str_contains($answer, 'which one'),
+            "Expected the assistant to ask HR to clarify which Joshua was meant. Answer: {$answer}"
+        );
+    }
 }
