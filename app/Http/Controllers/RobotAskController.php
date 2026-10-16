@@ -85,10 +85,73 @@ class RobotAskController extends Controller
             $q = $this->normalize($text);
             $user = $this->userInfo($role, $data['employee_name'] ?? null);
 
+            $explicitPerson = null;
+
+            if ($role === 'HR') {
+                $personMatches = $this->findEmployees($q, $this->employeeNames());
+
+                if ($personMatches->count() === 1) {
+                    $candidate = (string) $personMatches->first();
+                    $normalizedCandidate = $this->normalize($candidate);
+
+                    if (
+                        $normalizedCandidate !== ''
+                        && preg_match(
+                            '/(?<![\pL\pN])'
+                                . preg_quote($normalizedCandidate, '/')
+                                . '(?![\pL\pN])/u',
+                            $q
+                        ) === 1
+                    ) {
+                        $explicitPerson = $candidate;
+                    }
+                }
+
+                $isPronounFollowUp = preg_match(
+                    '/\b(?:he|she|him|her|his|hers|they|them|their|theirs|siya|niya|nya|sya)\b/iu',
+                    $text
+                ) === 1;
+
+                if ($explicitPerson === null && $isPronounFollowUp) {
+                    $rememberedPerson = Cache::get(
+                        $this->selectedPersonKey($request, $role)
+                    );
+
+                    if (
+                        is_string($rememberedPerson)
+                        && $rememberedPerson !== ''
+                    ) {
+                        $q = $this->normalize($q . ' ' . $rememberedPerson);
+                    }
+                }
+
+                $normalizedText = $this->normalize($text);
+                $isTemporalFollowUp = preg_match(
+                    '/^(?:what about|how about|and|last week|this week|last month|this month|yesterday|today|kahapon|ngayon)\\b/iu',
+                    $normalizedText
+                ) === 1;
+
+                if (
+                    $explicitPerson === null
+                    && !$isPronounFollowUp
+                    && !$isTemporalFollowUp
+                ) {
+                    Cache::forget($this->selectedPersonKey($request, $role));
+                }
+            }
+
             // 1. Exact and instant: every number comes straight from the database.
             $answer = $this->byRules($role, $q, $user);
 
             if ($answer !== null) {
+                if ($role === 'HR' && $explicitPerson !== null) {
+                    Cache::put(
+                        $this->selectedPersonKey($request, $role),
+                        $explicitPerson,
+                        now()->addHour()
+                    );
+                }
+
                 $this->remember($request, $role, $text, '(showed ' . $answer['title'] . ')');
 
                 return response()->json($answer);
@@ -322,6 +385,13 @@ class RobotAskController extends Controller
         $session = $request->hasSession() ? $request->session()->getId() : 'cli';
 
         return "robot-chat:{$session}:{$role}";
+    }
+
+    private function selectedPersonKey(Request $request, string $role): string
+    {
+        $session = $request->hasSession() ? $request->session()->getId() : 'cli';
+
+        return "robot-selected-person:{$session}:{$role}";
     }
 
     private function history(Request $request, string $role): array
@@ -1820,10 +1890,28 @@ class RobotAskController extends Controller
         return ['All time', null, null];
     }
 
-    // Matches a first, middle or last name: "ni joshua" finds "Joshua Balde"
+    // Prefer a complete name match; otherwise allow partial-name matching.
     private function findEmployees(string $q, Collection $names): Collection
     {
-        $words = collect(explode(' ', $q));
+        $normalizedQuery = $this->normalize($q);
+
+        $exactNames = $names
+            ->filter(function ($name) use ($normalizedQuery) {
+                $normalizedName = $this->normalize((string) $name);
+
+                return $normalizedName !== ''
+                    && preg_match(
+                        '/(?<![\pL\pN])' . preg_quote($normalizedName, '/') . '(?![\pL\pN])/u',
+                        $normalizedQuery
+                    ) === 1;
+            })
+            ->values();
+
+        if ($exactNames->isNotEmpty()) {
+            return $exactNames;
+        }
+
+        $words = collect(explode(' ', $normalizedQuery));
 
         return $names
             ->filter(function ($name) use ($words) {
