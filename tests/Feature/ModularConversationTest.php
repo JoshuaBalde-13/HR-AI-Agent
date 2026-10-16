@@ -331,4 +331,68 @@ class ModularConversationTest extends TestCase
         $this->assertStringContainsString('0 of 4 required documents', $answerText);
         $this->assertStringNotContainsString('joshua balde', $answerText);
     }
+
+    public function test_clarified_employee_context_is_reused_for_attendance_follow_up(): void
+    {
+        config(['ollama.enabled' => false]);
+
+        Employee::create([
+            'name' => 'Joshua Balde',
+            'position' => 'Security Guard',
+            'employment_status' => 'Active',
+        ]);
+
+        Employee::create([
+            'name' => 'Joshua Santos',
+            'position' => 'Operations Supervisor',
+            'employment_status' => 'Active',
+        ]);
+
+        $baldeClockIn = now()->subDays(3)->setTime(8, 0);
+        AttendanceLog::create([
+            'employee_name' => 'Joshua Balde',
+            'time_in' => $baldeClockIn,
+            'time_out' => $baldeClockIn->copy()->addHours(8),
+        ]);
+
+        $santosClockIn = now()->subDay()->setTime(10, 0);
+        AttendanceLog::create([
+            'employee_name' => 'Joshua Santos',
+            'time_in' => $santosClockIn,
+            'time_out' => $santosClockIn->copy()->addHours(8),
+        ]);
+
+        $assistant = app(HRISAssistantService::class);
+        $context = $this->hrContext('clarified-attendance-' . uniqid());
+
+        $clarification = $assistant->ask(
+            $context,
+            'What position does Joshua have?'
+        );
+
+        $clarificationText = mb_strtolower(
+            json_encode($clarification, JSON_UNESCAPED_UNICODE)
+        );
+
+        $this->assertStringContainsString('joshua balde', $clarificationText);
+        $this->assertStringContainsString('joshua santos', $clarificationText);
+
+        $assistant->ask($context, 'Joshua Santos');
+
+        $memory = app(ConversationMemory::class);
+        $this->assertSame('Joshua Santos', $memory->lastPerson($context));
+
+        $answer = $assistant->ask($context, 'When did he last clock in?');
+
+        $answerText = mb_strtolower(
+            json_encode($answer, JSON_UNESCAPED_UNICODE)
+        );
+
+        $this->assertStringContainsString('joshua santos', $answerText);
+        $this->assertStringContainsString(
+            mb_strtolower($santosClockIn->format('M j')),
+            $answerText
+        );
+        $this->assertStringNotContainsString('joshua balde', $answerText);
+    }
 }
