@@ -478,4 +478,120 @@ public function test_robot_endpoint_keeps_employee_context_isolated_between_sess
         $sessionAText
     );
 }
+public function test_robot_endpoint_switches_employee_context_when_another_employee_is_named(): void
+{
+    $this->withCredentials();
+
+    config(['ollama.enabled' => false]);
+
+    Employee::create([
+        'name' => 'Joshua Balde',
+        'position' => 'Security Guard',
+        'employment_status' => 'Active',
+    ]);
+
+    Employee::create([
+        'name' => 'Joshua Santos',
+        'position' => 'Security Officer',
+        'employment_status' => 'Active',
+    ]);
+
+    $baldeClockIn = now()->subDays(3)->setTime(8, 0);
+    $santosClockIn = now()->subDay()->setTime(10, 0);
+
+    AttendanceLog::create([
+        'employee_name' => 'Joshua Balde',
+        'time_in' => $baldeClockIn,
+        'time_out' => $baldeClockIn->copy()->addHours(8),
+    ]);
+
+    AttendanceLog::create([
+        'employee_name' => 'Joshua Santos',
+        'time_in' => $santosClockIn,
+        'time_out' => $santosClockIn->copy()->addHours(8),
+    ]);
+
+    $this->actingAs($this->hr, 'web');
+
+    $sessionCookieName = config('session.cookie');
+
+    // 1. Select Joshua Santos.
+    $selection = $this->postJson(route('robot.ask'), [
+        'question' => 'Joshua Santos',
+        'role' => 'HR',
+        'employee_name' => null,
+    ]);
+
+    $selection->assertOk();
+
+    $sessionCookie = $selection
+        ->getCookie($sessionCookieName)?->getValue();
+
+    $this->assertNotNull($sessionCookie);
+
+    $this->withCookie($sessionCookieName, $sessionCookie);
+
+    $selectionText = mb_strtolower(
+        json_encode($selection->json(), JSON_UNESCAPED_UNICODE)
+    );
+
+    $this->assertStringContainsString('joshua santos', $selectionText);
+    $this->assertStringContainsString('security officer', $selectionText);
+
+    // 2. Explicitly switch to Joshua Balde.
+    $switch = $this->postJson(route('robot.ask'), [
+        'question' => 'What position does Joshua Balde have?',
+        'role' => 'HR',
+        'employee_name' => null,
+    ]);
+
+    $switch->assertOk();
+
+    $switchCookie = $switch
+        ->getCookie($sessionCookieName)?->getValue();
+
+    $this->assertNotNull($switchCookie);
+    $this->assertSame(
+        $sessionCookie,
+        $switchCookie,
+        'The session should remain stable while switching employees.'
+    );
+
+    $this->withCookie($sessionCookieName, $switchCookie);
+
+    $switchText = mb_strtolower(
+        json_encode($switch->json(), JSON_UNESCAPED_UNICODE)
+    );
+
+    $this->assertStringContainsString('joshua balde', $switchText);
+    $this->assertStringContainsString('security guard', $switchText);
+    $this->assertStringNotContainsString('joshua santos', $switchText);
+
+    // 3. The pronoun follow-up should now refer to Joshua Balde.
+    $attendance = $this->postJson(route('robot.ask'), [
+        'question' => 'When did he last clock in?',
+        'role' => 'HR',
+        'employee_name' => null,
+    ]);
+
+    $attendance->assertOk();
+
+    $attendanceText = mb_strtolower(
+        json_encode($attendance->json(), JSON_UNESCAPED_UNICODE)
+    );
+
+    $this->assertStringContainsString('joshua balde', $attendanceText);
+
+    $this->assertStringContainsString(
+        mb_strtolower($baldeClockIn->format('M j')),
+        $attendanceText
+    );
+
+    $this->assertStringNotContainsString('joshua santos', $attendanceText);
+
+    $this->assertStringNotContainsString(
+        mb_strtolower($santosClockIn->format('M j')),
+        $attendanceText
+    );
+}
 }
