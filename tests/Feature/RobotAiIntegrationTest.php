@@ -352,4 +352,130 @@ class RobotAiIntegrationTest extends TestCase
         $attendanceText
     );
 }
+public function test_robot_endpoint_keeps_employee_context_isolated_between_sessions(): void
+{
+    $this->withCredentials();
+
+    config(['ollama.enabled' => false]);
+
+    Employee::create([
+        'name' => 'Joshua Balde',
+        'position' => 'Security Guard',
+        'employment_status' => 'Active',
+    ]);
+
+    Employee::create([
+        'name' => 'Joshua Santos',
+        'position' => 'Security Officer',
+        'employment_status' => 'Active',
+    ]);
+
+    $santosClockIn = now()->subDay()->setTime(10, 0);
+
+    AttendanceLog::create([
+        'employee_name' => 'Joshua Santos',
+        'time_in' => $santosClockIn,
+        'time_out' => $santosClockIn->copy()->addHours(8),
+    ]);
+
+    $this->actingAs($this->hr, 'web');
+
+    $sessionCookieName = config('session.cookie');
+
+    // Session A: ask about an ambiguous first name.
+    $clarification = $this->postJson(route('robot.ask'), [
+        'question' => 'What position does Joshua have?',
+        'role' => 'HR',
+        'employee_name' => null,
+    ]);
+
+    $clarification->assertOk();
+
+    $sessionCookieA = $clarification
+        ->getCookie($sessionCookieName)?->getValue();
+
+    $this->assertNotNull($sessionCookieA);
+
+    $this->withCookie($sessionCookieName, $sessionCookieA);
+
+    // Session A: select Joshua Santos.
+    $selection = $this->postJson(route('robot.ask'), [
+        'question' => 'Joshua Santos',
+        'role' => 'HR',
+        'employee_name' => null,
+    ]);
+
+    $selection->assertOk();
+
+    $selectionText = mb_strtolower(
+        json_encode($selection->json(), JSON_UNESCAPED_UNICODE)
+    );
+
+    $this->assertStringContainsString('joshua santos', $selectionText);
+    $this->assertStringContainsString('security officer', $selectionText);
+
+    $selectionCookie = $selection
+        ->getCookie($sessionCookieName)?->getValue();
+
+    $this->assertSame($sessionCookieA, $selectionCookie);
+
+    // Session B: remove Session A's cookie to start a separate session.
+    $this->withCookie($sessionCookieName, 'invalid-session-cookie');
+
+    $sessionBResponse = $this->postJson(route('robot.ask'), [
+        'question' => 'When did he last clock in?',
+        'role' => 'HR',
+        'employee_name' => null,
+    ]);
+
+    $sessionBResponse->assertOk();
+
+    $sessionCookieB = $sessionBResponse
+        ->getCookie($sessionCookieName)?->getValue();
+
+    $this->assertNotNull($sessionCookieB);
+    $this->assertNotSame(
+        $sessionCookieA,
+        $sessionCookieB,
+        'Session B must have a different session cookie from Session A.'
+    );
+
+    $sessionBText = mb_strtolower(
+        json_encode($sessionBResponse->json(), JSON_UNESCAPED_UNICODE)
+    );
+
+    $this->assertStringContainsString(
+        'please include the employee name',
+        $sessionBText
+    );
+
+    $this->assertStringNotContainsString('joshua santos', $sessionBText);
+
+    $this->assertStringNotContainsString(
+        mb_strtolower($santosClockIn->format('M j, Y g:i A')),
+        $sessionBText
+    );
+
+    // Return to Session A: its selected employee context should still work.
+    $this->withCookie($sessionCookieName, $sessionCookieA);
+
+    $sessionAFollowUp = $this->postJson(route('robot.ask'), [
+        'question' => 'When did he last clock in?',
+        'role' => 'HR',
+        'employee_name' => null,
+    ]);
+
+    $sessionAFollowUp->assertOk();
+
+    $sessionAText = mb_strtolower(
+        json_encode($sessionAFollowUp->json(), JSON_UNESCAPED_UNICODE)
+    );
+
+    $this->assertStringContainsString('joshua santos', $sessionAText);
+
+    $this->assertStringContainsString(
+        mb_strtolower($santosClockIn->format('M j')),
+        $sessionAText
+    );
+}
 }
