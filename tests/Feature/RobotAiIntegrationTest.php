@@ -235,4 +235,121 @@ class RobotAiIntegrationTest extends TestCase
         );
         $this->assertStringNotContainsString('joshua balde', $attendanceText);
     }
+
+    public function test_robot_endpoint_clears_selected_employee_after_unrelated_greeting(): void
+{
+    $this->withCredentials();
+
+    config(['ollama.enabled' => false]);
+
+    Employee::create([
+        'name' => 'Joshua Balde',
+        'position' => 'Security Guard',
+        'employment_status' => 'Active',
+    ]);
+
+    Employee::create([
+        'name' => 'Joshua Santos',
+        'position' => 'Security Officer',
+        'employment_status' => 'Active',
+    ]);
+
+    $santosClockIn = now()->subDay()->setTime(10, 0);
+
+    AttendanceLog::create([
+        'employee_name' => 'Joshua Santos',
+        'time_in' => $santosClockIn,
+        'time_out' => $santosClockIn->copy()->addHours(8),
+    ]);
+
+    $this->actingAs($this->hr, 'web');
+
+    $sessionCookieName = config('session.cookie');
+
+    // 1. Ask about an ambiguous first name.
+    $clarification = $this->postJson(route('robot.ask'), [
+        'question' => 'What position does Joshua have?',
+        'role' => 'HR',
+        'employee_name' => null,
+    ]);
+
+    $clarification->assertOk();
+
+    $sessionCookie = $clarification
+        ->getCookie($sessionCookieName)?->getValue();
+
+    $this->assertNotNull($sessionCookie);
+
+    $this->withCookie($sessionCookieName, $sessionCookie);
+
+    // 2. Select Joshua Santos.
+    $selection = $this->postJson(route('robot.ask'), [
+        'question' => 'Joshua Santos',
+        'role' => 'HR',
+        'employee_name' => null,
+    ]);
+
+    $selection->assertOk();
+
+    $selectionCookie = $selection
+        ->getCookie($sessionCookieName)?->getValue();
+
+    $this->assertNotNull($selectionCookie);
+    $this->assertSame($sessionCookie, $selectionCookie);
+
+    $this->withCookie($sessionCookieName, $selectionCookie);
+
+    $selectionText = mb_strtolower(
+        json_encode($selection->json(), JSON_UNESCAPED_UNICODE)
+    );
+
+    $this->assertStringContainsString('joshua santos', $selectionText);
+    $this->assertStringContainsString('security officer', $selectionText);
+
+    // 3. Ask an unrelated question. This should clear the selected employee.
+    $thanks = $this->postJson(route('robot.ask'), [
+        'question' => 'Thank you',
+        'role' => 'HR',
+        'employee_name' => null,
+    ]);
+
+    $thanks->assertOk();
+
+    $thanksCookie = $thanks
+        ->getCookie($sessionCookieName)?->getValue();
+
+    $this->assertNotNull($thanksCookie);
+    $this->assertSame($sessionCookie, $thanksCookie);
+
+    $this->withCookie($sessionCookieName, $thanksCookie);
+
+    // 4. A pronoun must not reuse Joshua Santos after the subject changed.
+    $attendance = $this->postJson(route('robot.ask'), [
+        'question' => 'When did he last clock in?',
+        'role' => 'HR',
+        'employee_name' => null,
+    ]);
+
+    $attendance->assertOk();
+
+    $attendanceText = mb_strtolower(
+        json_encode($attendance->json(), JSON_UNESCAPED_UNICODE)
+    );
+
+    // The robot should request a name, not reveal Santos's attendance.
+    $this->assertStringContainsString(
+        'please include the employee name',
+        $attendanceText
+    );
+
+    $this->assertStringNotContainsString(
+        'joshua santos',
+        $attendanceText
+    );
+
+    $this->assertStringNotContainsString(
+        mb_strtolower($santosClockIn->format('M j, Y g:i A')),
+        $attendanceText
+    );
+}
 }
