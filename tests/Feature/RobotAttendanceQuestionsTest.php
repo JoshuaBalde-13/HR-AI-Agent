@@ -333,4 +333,32 @@ class RobotAttendanceQuestionsTest extends TestCase
         );
     }
 
+
+    public function test_unknown_employee_attendance_query_does_not_show_other_employees(): void
+    {
+        // Joshua is on duty, but HR asks about an unknown person.
+        $clockIn = now()->subHours(2);
+
+        AttendanceLog::create([
+            'employee_name' => 'Joshua Balde',
+            'time_in' => $clockIn,
+            'time_out' => null,
+        ]);
+
+        $response = $this->actingAs($this->hr, 'web')
+            ->postJson(route('robot.ask'), [
+                'question' => 'Attendance of Alex',
+                'role' => 'HR',
+                'employee_name' => null,
+            ]);
+
+        $response->assertOk();
+
+        $answer = mb_strtolower(
+            json_encode($response->json(), JSON_UNESCAPED_UNICODE)
+        );
+
+        $this->assertStringContainsString('alex', $answer);
+        $this->assertStringNotContainsString('joshua balde', $answer);
+    }
 }
