@@ -361,4 +361,55 @@ class RobotAttendanceQuestionsTest extends TestCase
         $this->assertStringContainsString('alex', $answer);
         $this->assertStringNotContainsString('joshua balde', $answer);
     }
+
+    public function test_hr_is_asked_to_clarify_ambiguous_attendance_name(): void
+    {
+        Employee::create([
+            'name' => 'Joshua Balde',
+            'position' => 'Security Guard',
+            'employment_status' => 'Active',
+        ]);
+
+        Employee::create([
+            'name' => 'Joshua Santos',
+            'position' => 'Security Guard',
+            'employment_status' => 'Active',
+        ]);
+
+        $firstClockIn = now()->subHours(4);
+
+        AttendanceLog::create([
+            'employee_name' => 'Joshua Balde',
+            'time_in' => $firstClockIn,
+            'time_out' => $firstClockIn->copy()->addHours(8),
+        ]);
+
+        $secondClockIn = now()->subHours(2);
+
+        AttendanceLog::create([
+            'employee_name' => 'Joshua Santos',
+            'time_in' => $secondClockIn,
+            'time_out' => $secondClockIn->copy()->addHours(8),
+        ]);
+
+        $response = $this->actingAs($this->hr, 'web')->postJson(
+            route('robot.ask'),
+            [
+                'question' => 'When was Joshua last clocked in?',
+                'role' => 'HR',
+                'employee_name' => null,
+            ]
+        );
+
+        $response->assertOk();
+
+        $answer = mb_strtolower(
+            json_encode($response->json(), JSON_UNESCAPED_UNICODE)
+        );
+
+        $this->assertStringContainsString('which employee', $answer);
+        $this->assertStringContainsString('joshua balde', $answer);
+        $this->assertStringContainsString('joshua santos', $answer);
+        $this->assertStringContainsString('please use the full name', $answer);
+    }
 }
