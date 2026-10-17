@@ -140,6 +140,9 @@ class RobotAskController extends Controller
                 }
             }
 
+            // Resolve short time-only follow-ups from the last question when the topic is clear.
+            $q = $this->applyTemporalFollowUpContext($request, $role, $q);
+
             // 1. Exact and instant: every number comes straight from the database.
             $answer = $this->byRules($role, $q, $user);
 
@@ -380,6 +383,61 @@ class RobotAskController extends Controller
     |--------------------------------------------------------------------------
     */
 
+    /**
+     * Use recent conversation context for time-only follow-ups such as
+     * "Ilan kahapon?", but only when the previous question was an application count.
+     */
+    private function applyTemporalFollowUpContext(
+        Request $request,
+        string $role,
+        string $q
+    ): string {
+        if ($role !== 'HR') {
+            return $q;
+        }
+
+        $normalized = $this->normalize($q);
+        $isTimeOnlyFollowUp = preg_match(
+            '/^(?:(?:ilan|ilang|how many)\s+)?(?:kahapon|yesterday|today|ngayon|ngayong araw)$/u',
+            $normalized
+        ) === 1;
+
+        if (!$isTimeOnlyFollowUp) {
+            return $q;
+        }
+
+        foreach (array_reverse($this->history($request, $role)) as $entry) {
+            if (($entry['role'] ?? null) !== 'user') {
+                continue;
+            }
+
+            $previous = $this->normalize((string) ($entry['text'] ?? ''));
+            $wasApplicationCount = $this->has($previous, [
+                'applicant',
+                'application',
+                'aplikante',
+                'aplikasyon',
+                'nag apply',
+                'nagapply',
+            ]) && $this->has($previous, [
+                'ilan',
+                'ilang',
+                'how many',
+                'count',
+                'number of',
+            ]);
+
+            // Only the most recent user message establishes the context.
+            if ($wasApplicationCount) {
+                return 'applications ' . $normalized;
+            }
+
+            break;
+        }
+
+        return $q;
+    }
+
     private function historyKey(Request $request, string $role): string
     {
         $session = $request->hasSession() ? $request->session()->getId() : 'cli';
@@ -454,6 +512,18 @@ class RobotAskController extends Controller
                     'medium'
                 ),
             ]);
+        }
+
+        $factAnswer = $this->hrEmployeeFactQuestion($q);
+
+        if ($factAnswer !== null) {
+            return $factAnswer;
+        }
+
+        $existenceAnswer = $this->hrEmployeeExistenceQuestion($q);
+
+        if ($existenceAnswer !== null) {
+            return $existenceAnswer;
         }
 
         if ($this->has($q, self::EMPLOYEE_WORDS)) {
@@ -1186,6 +1256,229 @@ class RobotAskController extends Controller
     }
 
     /**
+     * Return a concise answer when HR asks for one employee fact.
+     * General profile requests continue to use personProfile().
+     */
+    private function hrEmployeeFactQuestion(string $q): ?array
+    {
+        $requestedName = $this->requestedPersonName($q);
+
+        if ($requestedName === null) {
+            return null;
+        }
+
+        $focus = null;
+
+        if ($this->has($q, ['position', 'role'])) {
+            $focus = 'position';
+        } elseif ($this->has($q, [
+            'hired',
+            'hire date',
+            'date hired',
+            'since when',
+            'became our employee',
+            'become our employee',
+        ])) {
+            $focus = 'hired';
+        } elseif ($this->has($q, [
+            'active',
+            'employment status',
+            'currently employed',
+        ])) {
+            $focus = 'status';
+        }
+
+        if ($focus === null) {
+            return null;
+        }
+
+        $normalizedRequestedName = $this->normalize($requestedName);
+        $employees = Employee::query()
+            ->get(['id', 'name', 'position', 'employment_status', 'date_hired']);
+
+        $employee = $employees->first(
+            fn ($candidate) => $this->normalize((string) $candidate->name)
+                === $normalizedRequestedName
+        );
+
+        // A first name may be used only when it identifies one employee.
+        // Never substitute a different full name for the one HR supplied.
+        if ($employee === null && !str_contains($normalizedRequestedName, ' ')) {
+            $matches = $this->findEmployees(
+                $normalizedRequestedName,
+                $employees->pluck('name')
+            );
+
+            if ($matches->count() > 1) {
+                return $this->answer('Which employee?', [
+                    $this->row(
+                        'More than one employee match: '
+                            . $matches->implode(', ')
+                            . '. Please use the full name.',
+                        'medium'
+                    ),
+                ]);
+            }
+
+            if ($matches->count() === 1) {
+                $matchedName = (string) $matches->first();
+                $employee = $employees->first(
+                    fn ($candidate) => $this->normalize((string) $candidate->name)
+                        === $this->normalize($matchedName)
+                );
+            }
+        }
+
+        if ($employee === null) {
+            return $this->answer('Employee not found', [
+                $this->row(
+                    "No employee record was found for {$requestedName}.",
+                    'medium'
+                ),
+            ]);
+        }
+
+        $name = (string) $employee->name;
+
+        if ($focus === 'position') {
+            $position = $employee->position ?: 'not recorded';
+
+            return $this->answer($name, [
+                $this->row(
+                    "Position: {$position}.",
+                    'medium',
+                    null,
+                    'Position'
+                ),
+            ]);
+        }
+
+        if ($focus === 'hired') {
+            $date = $employee->date_hired
+                ? $employee->date_hired->format('M j, Y')
+                : null;
+
+            return $this->answer($name, [
+                $this->row(
+                    $date
+                        ? "Date hired: {$date}."
+                        : "The hire date for {$name} is not recorded.",
+                    'medium',
+                    null,
+                    'Hire date'
+                ),
+            ]);
+        }
+
+        $status = $employee->employment_status ?: 'not recorded';
+
+        return $this->answer($name, [
+            $this->row(
+                "Employment status: {$status}.",
+                'medium',
+                null,
+                'Employment status'
+            ),
+        ]);
+    }
+
+    /**
+     * Detect named employee-existence questions before the general employee list.
+     * This checks Employee records only, not applicants or legacy attendance names.
+     */
+    private function hrEmployeeExistenceQuestion(string $q): ?array
+    {
+        $normalized = $this->normalize($q);
+        $patterns = [
+            '/^may\s+(?:employee|empleyado|staff)\s+ba\s+(?:tayo(?:ng)?|natin|naming|namin)\s+(.+)$/u',
+            '/^may\s+(?:employee|empleyado|staff)\s+ba\s+si\s+(.+)$/u',
+            '/^do we have\s+(?:an?\s+)?(?:employee|staff)\s+(?:(?:named|called)\s+)?(.+)$/u',
+            '/^is\s+(.+?)\s+an?\s+employee$/u',
+            '/^(?:employee|empleyado)\s+ba\s+(?:natin\s+)?(?:si\s+)?(.+)$/u',
+        ];
+
+        $requestedName = null;
+
+        foreach ($patterns as $pattern) {
+            if (preg_match($pattern, $normalized, $matches) === 1) {
+                $requestedName = trim($matches[1]);
+                break;
+            }
+        }
+
+        if ($requestedName === null || $requestedName === '') {
+            return null;
+        }
+
+        $requestedName = preg_replace(
+            '/^(?:(?:named|called|na named|na nagngangalang|si)\s+)/u',
+            '',
+            $requestedName
+        );
+        $requestedName = trim((string) $requestedName);
+
+        if ($requestedName === '') {
+            return null;
+        }
+
+        $names = Employee::query()->whereNotNull('name')->pluck('name')->values();
+        $normalizedRequestedName = $this->normalize($requestedName);
+
+        $exactName = $names->first(
+            fn ($name) => $this->normalize((string) $name) === $normalizedRequestedName
+        );
+
+        if ($exactName !== null) {
+            return $this->answer('Employee found', [
+                $this->row(
+                    "{$exactName} is listed in the employee records.",
+                    'medium',
+                    null,
+                    'Employee'
+                ),
+            ]);
+        }
+
+        // One-token names may identify an employee when there is exactly one match.
+        if (!str_contains($normalizedRequestedName, ' ')) {
+            $matches = $this->findEmployees($normalizedRequestedName, $names);
+
+            if ($matches->count() > 1) {
+                return $this->answer('Which employee?', [
+                    $this->row(
+                        'More than one employee matches that name: '
+                            . $matches->implode(', ')
+                            . '. Please use the full name.',
+                        'medium'
+                    ),
+                ]);
+            }
+
+            if ($matches->count() === 1) {
+                $matchedName = (string) $matches->first();
+
+                return $this->answer('Employee found', [
+                    $this->row(
+                        "{$matchedName} is listed in the employee records.",
+                        'medium',
+                        null,
+                        'Employee'
+                    ),
+                ]);
+            }
+        }
+
+        return $this->answer('Employee not found', [
+            $this->row(
+                "No employee record was found for {$requestedName}.",
+                'medium',
+                null,
+                'Employee'
+            ),
+        ]);
+    }
+
+    /**
      * Extract a person's name from common, specific HR lookup questions.
      * The input has already been normalized, so possessive apostrophes appear
      * as a standalone "s" token (for example, "Joshua Santos s position").
@@ -1203,6 +1496,7 @@ class RobotAskController extends Controller
         );
 
         $patterns = [
+            '/^what\s+position\s+does\s+(.+?)\s+have\b/u',
             '/^(?:show me|find|open|view|display)\s+(.+?)\s+(?:employee\s+)?(?:record|profile)\b/u',
             '/^(?:what is|what s|tell me about|tell me|show me|check)\s+(.+?)\s+(?:application\s+status|employment\s+status|position|role)\b/u',
             '/^is\s+(.+?)\s+(?:currently\s+)?active\b/u',
