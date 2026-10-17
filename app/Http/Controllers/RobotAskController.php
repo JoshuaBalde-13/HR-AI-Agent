@@ -439,6 +439,23 @@ class RobotAskController extends Controller
             return $this->hrDocuments($q);
         }
 
+        // A request for one employee record must not fall through to the
+        // general employee list when the requested person cannot be found.
+        if ($this->has($q, ['employee record', 'employee profile'])) {
+            $person = $this->hrPerson($q);
+
+            if ($person !== null) {
+                return $person;
+            }
+
+            return $this->answer('Person not found', [
+                $this->row(
+                    'I could not identify a matching employee or applicant. Please check the name.',
+                    'medium'
+                ),
+            ]);
+        }
+
         if ($this->has($q, self::EMPLOYEE_WORDS)) {
             return $this->hrEmployees($q);
         }
@@ -1168,15 +1185,109 @@ class RobotAskController extends Controller
         return $this->answer('Employees', $items);
     }
 
+    /**
+     * Extract a person's name from common, specific HR lookup questions.
+     * The input has already been normalized, so possessive apostrophes appear
+     * as a standalone "s" token (for example, "Joshua Santos s position").
+     */
+    private function requestedPersonName(string $q): ?string
+    {
+        $normalized = $this->normalize($q);
+
+        // Remove the normalized possessive token only when it directly
+        // precedes one of the supported question targets.
+        $normalized = preg_replace(
+            '/\s+s(?=\s+(?:application\s+status|employment\s+status|employee\s+(?:record|profile)|position|role|active|hired|employed)\b)/u',
+            '',
+            $normalized
+        );
+
+        $patterns = [
+            '/^(?:show me|find|open|view|display)\s+(.+?)\s+(?:employee\s+)?(?:record|profile)\b/u',
+            '/^(?:what is|what s|tell me about|tell me|show me|check)\s+(.+?)\s+(?:application\s+status|employment\s+status|position|role)\b/u',
+            '/^is\s+(.+?)\s+(?:currently\s+)?active\b/u',
+            '/^when was\s+(.+?)\s+(?:hired|employed)\b/u',
+        ];
+
+        foreach ($patterns as $pattern) {
+            if (preg_match($pattern, $normalized, $matches) === 1) {
+                $name = trim($matches[1]);
+
+                if ($name !== '') {
+                    return Str::title($name);
+                }
+            }
+        }
+
+        return null;
+    }
+
     // A person (applicant or employee) is named in the question.
     private function hrPerson(string $q): ?array
     {
         $people = $this->employeeNames()
             ->merge(Applicant::query()->pluck('name'))
+            ->filter()
             ->unique()
             ->sort()
             ->values();
 
+        $requestedName = $this->requestedPersonName($q);
+
+               if ($requestedName !== null) {
+            $normalizedRequestedName = $this->normalize($requestedName);
+
+            $exactName = $people->first(
+                fn ($name) => $this->normalize((string) $name)
+                    === $normalizedRequestedName
+            );
+
+            // A complete exact name always takes precedence.
+            if ($exactName !== null) {
+                return $this->personProfile((string) $exactName);
+            }
+
+            // A single first name can match when the result is unambiguous.
+            // Never use this fallback for a supplied full name.
+            $requestedTokenCount = collect(
+                explode(' ', $normalizedRequestedName)
+            )->filter(fn ($token) => $token !== '')->count();
+
+            if ($requestedTokenCount === 1) {
+                $partialMatches = $this->findEmployees(
+                    $normalizedRequestedName,
+                    $people
+                );
+
+                if ($partialMatches->count() === 1) {
+                    return $this->personProfile(
+                        (string) $partialMatches->first()
+                    );
+                }
+
+                if ($partialMatches->count() > 1) {
+                    return $this->answer('Which person?', [
+                        $this->row(
+                            'More than one match: '
+                                . $partialMatches->implode(', ') . '.',
+                            'medium'
+                        ),
+                        $this->row(
+                            'Please use the full name.',
+                            'low'
+                        ),
+                    ]);
+                }
+            }
+
+            // Unknown full names must not fall back to another person.
+            return $this->answer('Person not found', [
+                $this->row(
+                    "No employee or applicant record was found for {$requestedName}.",
+                    'medium'
+                ),
+            ]);
+        }
         $matches = $this->findEmployees($q, $people);
 
         if ($matches->count() === 1) {
@@ -1890,7 +2001,7 @@ class RobotAskController extends Controller
         return ['All time', null, null];
     }
 
-    // Prefer a complete name match; otherwise allow partial-name matching.
+    // Prefer the longest complete name match; otherwise allow partial-name matching.
     private function findEmployees(string $q, Collection $names): Collection
     {
         $normalizedQuery = $this->normalize($q);
@@ -1908,7 +2019,16 @@ class RobotAskController extends Controller
             ->values();
 
         if ($exactNames->isNotEmpty()) {
-            return $exactNames;
+            $longestNameLength = $exactNames->max(
+                fn ($name) => mb_strlen($this->normalize((string) $name))
+            );
+
+            return $exactNames
+                ->filter(
+                    fn ($name) => mb_strlen($this->normalize((string) $name))
+                        === $longestNameLength
+                )
+                ->values();
         }
 
         $words = collect(explode(' ', $normalizedQuery));
